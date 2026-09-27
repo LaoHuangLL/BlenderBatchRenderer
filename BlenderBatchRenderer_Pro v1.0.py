@@ -10,6 +10,7 @@ import math
 import ctypes
 import threading
 import queue
+import signal
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QListWidgetItem, QPushButton, QLabel, QLineEdit,
@@ -125,6 +126,8 @@ TRANSLATIONS = {
         "indep_process_tt": "适用于物理/SSS等复杂场景：每渲完一帧自动杀进程清空内存，防止越来越慢",
         "frame_sample_tiled": "当前帧进度: Sample: {c_s}/{t_s} | Tiles: {c_t}/{t_t}",
         "denoising": "正在降噪...",
+        "log_resume_progress": "检测到 {count} 个已经渲染好的帧，已计入总渲染进度（Blender 会自动跳过这些帧）。",
+        "log_scan_failed": "⚠️ 任务 “{name}” 的输出目录里有文件，但没能识别出已渲染的帧（示例文件：{samples}）。该任务进度会从 0 开始，请确认“输出路径”和帧文件命名是否一致。",
     },
     "en": {
         "title": "Blender Batch Renderer Pro | By 舟午YueMoon",
@@ -205,6 +208,8 @@ TRANSLATIONS = {
         "indep_process_tt": "Kills process after each frame to prevent memory leaks in complex scenes.",
         "frame_sample_tiled": "Frame Sample: {c_s}/{t_s} | Tiles: {c_t}/{t_t}",
         "denoising": "Denoising...",
+        "log_resume_progress": "Detected {count} already rendered frames, they are counted into the total progress (Blender will skip them).",
+        "log_scan_failed": "⚠️ Task \"{name}\" has files in its output folder but no rendered frames were recognized (sample files: {samples}). Its progress starts from 0; please check the output path and the frame file naming.",
     }
 }
 
@@ -225,6 +230,487 @@ def resource_path(relative_path):
 
 CONFIG_FILE = "BlenderBatchRenderer_config.json"
 SESSION_FILE = "BlenderBatchRenderer_session.json"
+SERVER_NAME = "BlenderBatchRenderer_Pro_SingleInstance"
+_LOCAL_SERVER = None
+
+# 子进程（Blender）不显示控制台窗口；同时让它成为新进程组的组长，
+# 这样停止渲染时可以定向投递 CTRL_BREAK：比 taskkill 轻量（不起额外进程），
+# 进程若自己处理该信号就能借机收尾，否则按系统默认行为被立即结束。
+# 注意：实测 Blender 后台模式只注册了 SIGINT（唯一目标是当前控制台的前台进程组，
+# 无法定向投递），不处理 SIGBREAK，所以这一步对 Blender 相当于“立即终止”，
+# 真正的兜底仍然是后面的 taskkill /F /T + psutil 递归清理。
+BLENDER_CREATE_FLAGS = (
+    getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+)
+
+_SESSION_LOCK = threading.Lock()
+_TRACK_LOCK = threading.Lock()
+_TRACKED_PROCS = set()    # 本程序启动的渲染 / 参数提取子进程，退出时统一清理
+_DETACHED_PROCS = set()   # 用户主动“打开工程”启动的 Blender，退出时不动它
+
+
+# ---------------------------------------------------------------------------
+# 帧号 / 已渲染帧统计
+# ---------------------------------------------------------------------------
+def _custom_frame_numbers(task):
+    """解析自定义帧；没有配置或全部非法时返回 None。"""
+    cf = str(getattr(task, 'custom_frames', '') or '').strip()
+    if not cf:
+        return None
+    nums = []
+    for part in cf.split(','):
+        part = part.strip()
+        if part.isdigit():
+            nums.append(int(part))
+    return nums or None
+
+
+def _task_frame_range(task):
+    """按起止帧/步长算出帧范围（range 对象，取长度是 O(1)）。"""
+    try:
+        start = int(task.frame_start)
+        end = int(task.frame_end)
+        step = int(task.frame_step)
+    except (TypeError, ValueError):
+        return None
+    if step <= 0:
+        step = 1
+    if end < start:
+        return None
+    return range(start, end + 1, step)
+
+
+def get_task_frame_numbers(task):
+    """返回任务需要渲染的帧号列表（自定义帧优先）。
+    进度统计、ETA、磁盘扫描都用它，保证口径一致。"""
+    if task is None:
+        return []
+    nums = _custom_frame_numbers(task)
+    if nums is not None:
+        return list(nums)
+    frame_range = _task_frame_range(task)
+    return list(frame_range) if frame_range is not None else []
+
+
+def count_task_frames(task):
+    """任务总帧数。不构造帧号列表，供调用频繁的统计逻辑使用。"""
+    if task is None:
+        return 0
+    nums = _custom_frame_numbers(task)
+    if nums is not None:
+        return len(nums)
+    frame_range = _task_frame_range(task)
+    return len(frame_range) if frame_range is not None else 0
+
+
+def resolve_output_scan(task):
+    """解析输出路径，返回 (要扫描的目录, 文件名前缀)。
+
+    - 输出路径本身是目录（例如 E:\\out2\\镜头\\）：Blender 在里面生成 0001.png，前缀为空；
+    - 输出路径是文件名前缀（例如 E:\\out2\\frame_）：Blender 生成 frame_0001.png。
+    路径不存在或为空时返回 None。
+    """
+    out_path = str(getattr(task, 'output_path', '') or '').strip().strip('"')
+    if not out_path:
+        return None
+    try:
+        norm_path = os.path.normpath(out_path)
+        if os.path.isdir(norm_path):
+            return norm_path, ""
+        return os.path.dirname(norm_path), os.path.basename(norm_path)
+    except Exception:
+        return None
+
+
+def _scan_dir_frame_numbers(scan_dir, base_name, expected_set):
+    """扫描目录，返回落在任务帧范围内的帧号集合。
+
+    优先按「文件名以数字开头」识别（0001.png）；一个都没识别到时，
+    才退回到带前缀的命名（镜头_0001.png），并只采用出现次数最多的那个前缀，
+    避免把同目录里其它任务的文件也算进来。
+    """
+    numeric = set()
+    loose = {}  # 前缀 -> 帧号集合
+    try:
+        with os.scandir(scan_dir) as entries:
+            for entry in entries:
+                name = entry.name
+                if base_name:
+                    if not name.startswith(base_name):
+                        continue
+                    suffix = name[len(base_name):]
+                    match = re.match(r'^(\d+)', suffix)
+                    if match:
+                        num = int(match.group(1))
+                        if num in expected_set:
+                            numeric.add(num)
+                    continue
+
+                match = re.match(r'^(\d+)', name)
+                if match:
+                    num = int(match.group(1))
+                    if num in expected_set:
+                        numeric.add(num)
+                    continue
+
+                tail = re.search(r'^(.*?)(\d+)\.[^.\\/]+$', name)
+                if tail:
+                    num = int(tail.group(2))
+                    if num in expected_set:
+                        loose.setdefault(tail.group(1), set()).add(num)
+    except Exception:
+        return numeric
+
+    if numeric or not loose:
+        return numeric
+    return max(loose.values(), key=len)
+
+
+def scan_existing_frames(task):
+    """返回该任务范围内「磁盘上已经存在」的帧号集合。
+
+    这些帧 Blender 会跳过，必须计入“总渲染进度”，进度才不会归零。
+    """
+    expected = get_task_frame_numbers(task)
+    if not expected:
+        return set()
+    target = resolve_output_scan(task)
+    if target is None:
+        return set()
+    scan_dir, base_name = target
+    if not scan_dir or not os.path.isdir(scan_dir):
+        return set()
+    return _scan_dir_frame_numbers(scan_dir, base_name, set(expected))
+
+
+def inspect_output_dir(task, sample_limit=3):
+    """返回 (输出目录里的条目数, 前几个文件名)。
+
+    仅用于诊断：目录里明明有文件却识别不出帧时，把样例文件名打到日志里，
+    方便判断是“输出路径不对”还是“文件命名不匹配”。
+    """
+    target = resolve_output_scan(task)
+    if target is None:
+        return 0, []
+    scan_dir = target[0]
+    if not scan_dir or not os.path.isdir(scan_dir):
+        return 0, []
+    count, samples = 0, []
+    try:
+        with os.scandir(scan_dir) as entries:
+            for entry in entries:
+                count += 1
+                if len(samples) < sample_limit:
+                    samples.append(entry.name)
+    except Exception:
+        return count, samples
+    return count, samples
+
+
+def count_output_dir_files(task):
+    """输出目录里有多少个条目（诊断用）。"""
+    return inspect_output_dir(task)[0]
+
+
+# ---------------------------------------------------------------------------
+# 子进程管理：登记 / 优雅停止 / 强制清理
+# ---------------------------------------------------------------------------
+def track_process(proc, detached=False):
+    if proc is None:
+        return
+    with _TRACK_LOCK:
+        (_DETACHED_PROCS if detached else _TRACKED_PROCS).add(proc)
+
+
+def untrack_process(proc):
+    if proc is None:
+        return
+    with _TRACK_LOCK:
+        _TRACKED_PROCS.discard(proc)
+        _DETACHED_PROCS.discard(proc)
+
+
+def _tracked_processes():
+    with _TRACK_LOCK:
+        return list(_TRACKED_PROCS)
+
+
+def _process_exited(proc):
+    if proc is None:
+        return True
+    try:
+        return proc.poll() is not None
+    except Exception:
+        return True
+
+
+def _wait_process_exit(proc, timeout, interval=0.05):
+    """在 timeout 秒内轮询等待进程退出，返回是否已退出（绝不无限等待）。"""
+    deadline = time.time() + max(0.0, float(timeout))
+    while True:
+        if _process_exited(proc):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(interval)
+
+
+def _pid_alive(pid):
+    if not pid or pid <= 0:
+        return False
+    if HAS_PSUTIL:
+        try:
+            return psutil.pid_exists(pid)
+        except Exception:
+            return False
+    try:
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    except Exception:
+        return False
+
+
+def _cancel_pending_pipe_io(stream):
+    """取消管道上挂起的读操作，防止读取线程永远卡在 ReadFile 里。"""
+    try:
+        import msvcrt
+        handle = msvcrt.get_osfhandle(stream.fileno())
+        if handle and handle != -1:
+            ctypes.windll.kernel32.CancelIoEx(ctypes.c_void_p(handle), None)
+    except Exception:
+        pass
+
+
+def release_process_handles(proc):
+    """关闭子进程的管道并回收句柄。
+    若这里不处理，读取线程可能阻塞在 ReadFile 上，导致本程序退出时卡死。"""
+    if proc is None:
+        return
+    stream = getattr(proc, 'stdout', None)
+    if stream is not None:
+        try:
+            _cancel_pending_pipe_io(stream)
+        except Exception:
+            pass
+        try:
+            stream.close()
+        except Exception:
+            pass
+    try:
+        if proc.poll() is None:
+            proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=1)
+    except Exception:
+        pass
+
+
+def send_graceful_stop(proc):
+    """给子进程定向投递 CTRL_BREAK（比 taskkill 轻量、少一层进程）。
+
+    进程若自己处理该信号就能借机收尾；不处理则被系统默认行为立即结束。
+    返回 True 表示事件已投递（不代表进程已经退出）。
+    """
+    pid = getattr(proc, 'pid', None)
+    if not pid or _process_exited(proc):
+        return False
+    ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+    if ctrl_break is None:
+        return False
+    try:
+        kernel32 = ctypes.windll.kernel32
+    except Exception:
+        return False
+
+    delivered = False
+    try:
+        kernel32.FreeConsole()
+        if kernel32.AttachConsole(int(pid)):
+            delivered = bool(kernel32.GenerateConsoleCtrlEvent(int(ctrl_break), int(pid)))
+    except Exception:
+        delivered = False
+    finally:
+        try:
+            kernel32.FreeConsole()
+        except Exception:
+            pass
+
+    if not delivered:
+        try:
+            proc.send_signal(ctrl_break)
+            delivered = True
+        except Exception:
+            pass
+    return delivered
+
+
+def terminate_process_tree(proc, grace=1.2, force_timeout=4.0):
+    """终止子进程及其整棵子树，返回 True 表示已确认退出。
+
+    顺序：优雅中断 -> taskkill /F /T -> psutil 递归清理 -> Popen.kill，
+    每一步都有超时，绝不死等，避免关软件时把自己也拖成僵尸进程。
+    """
+    if proc is None:
+        return True
+    pid = getattr(proc, 'pid', None)
+    if not pid:
+        return True
+
+    if _process_exited(proc):
+        # 已经退出的进程只需要回收句柄，不要再白跑一次 taskkill
+        release_process_handles(proc)
+        untrack_process(proc)
+        return True
+
+    if grace > 0 and not _process_exited(proc):
+        send_graceful_stop(proc)
+        if _wait_process_exit(proc, grace):
+            release_process_handles(proc)
+            untrack_process(proc)
+            return True
+
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=force_timeout,
+        )
+    except Exception:
+        pass
+    if _wait_process_exit(proc, 1.0):
+        release_process_handles(proc)
+        untrack_process(proc)
+        return True
+
+    if HAS_PSUTIL:
+        try:
+            parent = psutil.Process(pid)
+            procs = parent.children(recursive=True)
+            procs.append(parent)
+            for p in procs:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+            psutil.wait_procs(procs, timeout=force_timeout)
+        except Exception:
+            pass
+
+    try:
+        if not _process_exited(proc):
+            proc.kill()
+    except Exception:
+        pass
+
+    dead = _wait_process_exit(proc, 1.5)
+    release_process_handles(proc)
+    untrack_process(proc)
+    return dead
+
+
+def terminate_process_tree_by_pid(pid, force_timeout=4.0):
+    """按 PID 结束整棵进程树（只剩 PID、没有 Popen 对象的场景）。"""
+    if not _pid_alive(pid):
+        return True
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=force_timeout,
+        )
+    except Exception:
+        pass
+    if not _pid_alive(pid):
+        return True
+    if HAS_PSUTIL:
+        try:
+            parent = psutil.Process(pid)
+            procs = parent.children(recursive=True)
+            procs.append(parent)
+            for p in procs:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+            psutil.wait_procs(procs, timeout=force_timeout)
+        except Exception:
+            pass
+    return not _pid_alive(pid)
+
+
+def stop_processes(procs, grace=1.2, force_timeout=4.0):
+    """并行停止一批子进程：先统一优雅中断，再统一强杀（避免逐个等待拖慢响应）。"""
+    procs = [p for p in (procs or []) if p is not None and not _process_exited(p)]
+    if not procs:
+        return
+    if grace > 0:
+        for p in procs:
+            send_graceful_stop(p)
+        deadline = time.time() + grace
+        while time.time() < deadline and any(not _process_exited(p) for p in procs):
+            time.sleep(0.05)
+    for p in procs:
+        terminate_process_tree(p, grace=0.0, force_timeout=force_timeout)
+
+
+def terminate_all_tracked_processes(grace=0.0, force_timeout=4.0):
+    stop_processes(_tracked_processes(), grace=grace, force_timeout=force_timeout)
+
+
+def sweep_orphan_children(force_timeout=3.0):
+    """兜底：清理仍挂在名下的 Blender 子进程（跳过用户主动打开的 Blender）。"""
+    if not HAS_PSUTIL:
+        return
+    protected = set()
+    with _TRACK_LOCK:
+        for proc in _DETACHED_PROCS:
+            pid = getattr(proc, 'pid', None)
+            if pid:
+                protected.add(pid)
+    try:
+        children = psutil.Process(os.getpid()).children(recursive=True)
+    except Exception:
+        return
+    victims = []
+    for child in children:
+        if child.pid in protected:
+            continue
+        try:
+            name = child.name().lower()
+        except Exception:
+            name = ""
+        if "blender" in name:
+            victims.append(child)
+    for victim in victims:
+        try:
+            victim.kill()
+        except Exception:
+            pass
+    if victims:
+        try:
+            psutil.wait_procs(victims, timeout=force_timeout)
+        except Exception:
+            pass
+
+
+def force_exit(code=0):
+    """立即结束本进程。
+
+    用 TerminateProcess 而不是 os._exit：ExitProcess 会等待其它线程收尾，
+    一旦有线程卡在驱动 / 管道调用里，进程就会残留成关不掉的僵尸进程。
+    """
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.TerminateProcess(kernel32.GetCurrentProcess(), code)
+    except Exception:
+        pass
+    os._exit(code)
 
 
 class MyDelegate(QStyledItemDelegate):
@@ -256,7 +742,46 @@ class RenderTask:
         self.cameras_list = []
         self.after_render_action = "None"
         self.rendered_frames = 0
+        # 已渲染帧号集合：既有磁盘上已存在（Blender 会跳过）的帧，
+        # 也有本次新渲出来的帧，用来自动去重，保证进度只增不减、不会重复计算。
+        self.rendered_frame_set = set()
         self.scene_data = {}
+
+    def set_rendered_frames(self, frames):
+        """用一批帧号重置进度（例如开始渲染前扫描磁盘得到的结果）。"""
+        nums = set()
+        for f in frames or []:
+            try:
+                nums.add(int(f))
+            except (TypeError, ValueError):
+                continue
+        self.rendered_frame_set = nums
+        self.rendered_frames = len(nums)
+
+    def _pick_free_frame_number(self):
+        """找一个还没被计入进度的任务帧号（日志解析不出帧号时用）。"""
+        for f in get_task_frame_numbers(self):
+            if f not in self.rendered_frame_set:
+                return f
+        return None
+
+    def mark_frame_done(self, frame_num=None):
+        """记录一帧完成。已统计过的帧不会重复计数（Blender 重渲同帧时保持进度不变）。"""
+        num = None
+        if frame_num is not None:
+            try:
+                num = int(str(frame_num).strip())
+            except (TypeError, ValueError):
+                num = None
+        if num is None:
+            num = self._pick_free_frame_number()
+            if num is None:
+                return False
+        if num in self.rendered_frame_set:
+            return False
+        self.rendered_frame_set.add(num)
+        self.rendered_frames = len(self.rendered_frame_set)
+        return True
 
     def to_dict(self):
         return {
@@ -278,6 +803,7 @@ class RenderTask:
             "cameras_list": self.cameras_list,
             "after_render_action": self.after_render_action,
             "rendered_frames": self.rendered_frames,
+            "rendered_frame_set": sorted(self.rendered_frame_set),
             "scene_data": getattr(self, 'scene_data', {}),
             "custom_frames": getattr(self, 'custom_frames', ''),
             "independent_process": getattr(self, 'independent_process', False),
@@ -287,8 +813,23 @@ class RenderTask:
     def from_dict(cls, data):
         t = cls(data.get("blend_path", ""))
         for k, v in data.items():
+            if k in ("rendered_frame_set", "rendered_frames"):
+                continue  # 进度相关字段统一在下面处理，保证计数与帧集合一致
             if hasattr(t, k) or k == "scene_data":
                 setattr(t, k, v)
+        frames = data.get("rendered_frame_set")
+        if frames:
+            t.set_rendered_frames(frames)
+        else:
+            # 兼容旧版本会话文件：只有已渲染计数、没有帧集合
+            try:
+                legacy = int(data.get("rendered_frames", 0) or 0)
+            except (TypeError, ValueError):
+                legacy = 0
+            if legacy > 0:
+                t.set_rendered_frames(get_task_frame_numbers(t)[:legacy])
+            else:
+                t.set_rendered_frames(())
         return t
 
 
@@ -337,24 +878,26 @@ except Exception as e:
 
             self.proc = subprocess.Popen(
                 [self.blender_path, "--factory-startup", "-b", self.task.blend_path, "-P", ts],
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                creationflags=BLENDER_CREATE_FLAGS,
                 encoding='utf-8', errors='replace'
             )
+            track_process(self.proc)
             try:
                 stdout_data, _ = self.proc.communicate(timeout=30)
                 rc = self.proc.returncode
             except subprocess.TimeoutExpired:
-                try:
-                    self.proc.kill()
-                    self.proc.wait(timeout=2)
-                except Exception:
-                    pass
+                terminate_process_tree(self.proc, grace=0.8)
+                self.proc = None
                 self.task.load_status = "Failed"
                 self.task.error_msg = "参数提取超时 (30s)"
                 self.task_finished.emit(self.task)
                 return
             finally:
+                if self.proc is not None:
+                    untrack_process(self.proc)
+                    release_process_handles(self.proc)
                 self.proc = None
 
             if rc != 0 or not os.path.exists(json_p):
@@ -402,7 +945,7 @@ except Exception as e:
     def stop(self):
         try:
             if self.proc and self.proc.poll() is None:
-                self.proc.kill()
+                terminate_process_tree(self.proc, grace=0.0)
         except Exception:
             pass
 
@@ -443,7 +986,9 @@ class RenderWorker(QThread):
     def render_single_task(self, task):
         temp_script = None
         try:
-            task.rendered_frames = 0
+            # 注意：这里不能把 rendered_frames 归零。
+            # 上一次停止渲染前已经落盘的帧（Blender 这次会跳过）必须保留在进度里，
+            # 否则“总渲染进度”会在重新开始时回到 0。
             self.status_updated.emit(task, "Rendering")
             safe_out = task.output_path.replace("\\", "/")
 
@@ -504,9 +1049,25 @@ except Exception as e:
                     break
 
                 self.current_process = subprocess.Popen(
-                    args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    creationflags=subprocess.CREATE_NO_WINDOW, bufsize=0, env=env
+                    args, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    creationflags=BLENDER_CREATE_FLAGS, bufsize=0, env=env
                 )
+                track_process(self.current_process)
+
+                q = queue.Queue()
+                def _read_stdout(proc, output_queue):
+                    while True:
+                        try:
+                            b = proc.stdout.read(1)
+                            if not b:
+                                output_queue.put(None)
+                                break
+                            output_queue.put(b)
+                        except Exception:
+                            output_queue.put(None)
+                            break
+                threading.Thread(target=_read_stdout, args=(self.current_process, q), daemon=True).start()
 
                 if HAS_PSUTIL and getattr(self, 'cpu_pct', 1.0) <= 1.0:
                     try:
@@ -521,8 +1082,16 @@ except Exception as e:
                 frame_max_current = 0
 
                 while self.is_running:
-                    byte_char = self.current_process.stdout.read(1)
-                    if not byte_char:
+                    try:
+                        byte_char = q.get(timeout=0.1)
+                    except queue.Empty:
+                        
+                        if self.current_process.poll() is not None:
+                            break
+                        continue
+
+                    
+                    if byte_char is None:
                         if line_buf:
                             clean_line = line_buf.decode('utf-8', errors='replace').strip()
                             if clean_line:
@@ -587,7 +1156,7 @@ except Exception as e:
                         self.log_updated.emit(clean_line)
 
                         if "Saved:" in clean_line or "Append frame" in clean_line:
-                            frame_num = str(task.rendered_frames + 1)
+                            frame_num = None
                             if "Append frame" in clean_line:
                                 match = re.search(r'Append frame\s+(\d+)', clean_line)
                                 if match:
@@ -597,16 +1166,20 @@ except Exception as e:
                                 if match:
                                     frame_num = match[-1]
 
-                            self.frame_done.emit(task, frame_num)
+                            # 解析不出帧号时传空，由主线程挑一个还没统计的帧号，保证进度照常推进
+                            self.frame_done.emit(task, frame_num if frame_num is not None else "")
                             frame_max_current = 0
                     else:
                         line_buf.extend(byte_char)
 
                 if self.current_process:
-                    self.current_process.wait()
-                    if self.current_process.returncode != 0 and self.is_running:
+                    # 必须带超时等待：Blender 若卡在驱动调用里，绝不能让本线程无限等下去
+                    if not _wait_process_exit(self.current_process, 5.0):
+                        terminate_process_tree(self.current_process, grace=0.0)
+                    rc = self.current_process.poll()
+                    if rc not in (0, None) and self.is_running:
                         if not getattr(task, 'error_msg', ''):
-                            task.error_msg = f"Blender进程异常退出 (退出码: {self.current_process.returncode})。\n请查看右侧日志了解详情！"
+                            task.error_msg = f"Blender进程异常退出 (退出码: {rc})。\n请查看右侧日志了解详情！"
                         break
 
         except Exception as e:
@@ -622,14 +1195,15 @@ except Exception as e:
                 except Exception:
                     pass
 
-            if not self.is_running and self.current_process:
-                self.kill_process_tree(self.current_process.pid)
-
-            if self.current_process:
-                try:
-                    self.current_process.wait(timeout=2)
-                except Exception:
-                    pass
+            proc = self.current_process
+            if proc is not None:
+                if not self.is_running:
+                    terminate_process_tree(proc, grace=0.0)
+                elif not _wait_process_exit(proc, 3.0):
+                    terminate_process_tree(proc, grace=0.0)
+                else:
+                    untrack_process(proc)
+                    release_process_handles(proc)
                 self.current_process = None
 
             if self.is_running:
@@ -637,28 +1211,12 @@ except Exception as e:
                 self.status_updated.emit(task, "Completed" if is_ok else "Failed")
 
     def kill_process_tree(self, pid):
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                timeout=5,
-            )
-        except Exception:
-            pass
-
-        if HAS_PSUTIL:
-            try:
-                parent = psutil.Process(pid)
-                children = parent.children(recursive=True)
-                for child in children:
-                    try: child.kill()
-                    except Exception: pass
-                try: parent.kill()
-                except Exception: pass
-            except Exception:
-                pass
+        """终止渲染子进程（优先用登记在册的 Popen 对象，其次按 PID 处理）。"""
+        proc = self.current_process
+        if proc is not None and getattr(proc, 'pid', None) == pid:
+            terminate_process_tree(proc, grace=0.0)
+        else:
+            terminate_process_tree_by_pid(pid)
 
 
 class QuitConfirmDialog(QDialog):
@@ -717,7 +1275,7 @@ class ActionConfirmDialog(QDialog):
 
 class MainWindow(QMainWindow):
 
-    def save_session(self):
+    def save_session(self, blocking=False):
         try:
             current_row = self.task_list.currentRow()
             log_content = self.log_out.toHtml()
@@ -726,6 +1284,15 @@ class MainWindow(QMainWindow):
                 "tasks": [t.to_dict() for t in self.tasks],
                 "log_content": log_content
             }
+        except Exception:
+            return
+
+        if blocking:
+            # 退出流程里必须同步写完，否则进程一结束就可能丢数据
+            self._write_to_disk_task(data_to_save)
+            return
+
+        try:
             write_thread = threading.Thread(
                 target=self._write_to_disk_task,
                 args=(data_to_save,),
@@ -736,11 +1303,19 @@ class MainWindow(QMainWindow):
             pass
 
     def _write_to_disk_task(self, data):
-        try:
-            with open(SESSION_FILE, 'w', encoding='utf-8') as f:
-                json.dump(data, f)
-        except Exception:
-            pass
+        # 先写临时文件再替换，避免写入中途被打断导致会话文件损坏
+        tmp_file = SESSION_FILE + ".tmp"
+        with _SESSION_LOCK:
+            try:
+                with open(tmp_file, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False)
+                os.replace(tmp_file, SESSION_FILE)
+            except Exception:
+                try:
+                    if os.path.exists(tmp_file):
+                        os.remove(tmp_file)
+                except Exception:
+                    pass
 
     def load_session(self):
         if os.path.exists(SESSION_FILE):
@@ -796,11 +1371,13 @@ class MainWindow(QMainWindow):
         self.current_task = None
         self.workers = []
         self.is_rendering = False
+        self._exiting = False
         self.last_frame_time = time.time()
         self.batch_start_time = time.time()
         self.current_task_start_time = time.time()
         self.cached_avg_time_str = "--h--m--s"
         self.cached_eta_str = "--h--m--s"
+        self._last_disk_rescan = 0.0
 
         try:
             icon = QIcon(resource_path("favicon.ico"))
@@ -923,6 +1500,34 @@ class MainWindow(QMainWindow):
     def update_spinner(self):
         self.spinner_idx = (self.spinner_idx + 1) % len(self.spinner_frames)
         self.refresh_ui()
+        self.refresh_progress_from_disk()
+
+    def refresh_progress_from_disk(self, interval=15.0):
+        """渲染过程中定期把输出目录里已经渲好的帧并入进度（只增不减）。
+
+        兜底用：万一开始渲染时没能识别出已有帧（路径/命名有差异），
+        或者这些帧是在本程序之外产生的，进度也不会一直停在 0%。
+        """
+        if not self.is_rendering:
+            return
+        now = time.time()
+        if now - getattr(self, '_last_disk_rescan', 0.0) < interval:
+            return
+        self._last_disk_rescan = now
+        changed = False
+        for t in self.tasks:
+            if getattr(t, 'status', '') != "Rendering":
+                continue
+            found = scan_existing_frames(t)
+            if not found:
+                continue
+            missing = found - t.rendered_frame_set
+            if missing:
+                t.rendered_frame_set |= missing
+                t.rendered_frames = len(t.rendered_frame_set)
+                changed = True
+        if changed:
+            self.update_stat()
 
     def apply_theme(self):
         self.setStyleSheet(f"""
@@ -1275,6 +1880,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         event.ignore()
+        if getattr(self, '_exiting', False):
+            return
         if self.is_rendering:
             dialog = QuitConfirmDialog(self, self.tr)
             if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -1284,14 +1891,18 @@ class MainWindow(QMainWindow):
             self.cleanup_and_quit()
 
     def cleanup_and_quit(self):
+        if getattr(self, '_exiting', False):
+            return
+        self._exiting = True
+
         # 1. 停掉所有 Qt 定时器，避免退出过程中资源监视被打断
-        try:
-            if hasattr(self, 'monitor_timer'):
-                self.monitor_timer.stop()
-            if hasattr(self, 'spinner_timer'):
-                self.spinner_timer.stop()
-        except Exception:
-            pass
+        for timer_name in ('monitor_timer', 'spinner_timer'):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
 
         # 2. 复位电源状态（重要！）
         try:
@@ -1299,60 +1910,55 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # 3. 停掉所有渲染 worker
-        try:
-            if hasattr(self, 'workers'):
-                for w in self.workers:
-                    w.is_running = False
-                    if w.current_process:
-                        try:
-                            w.kill_process_tree(w.current_process.pid)
-                        except Exception:
-                            pass
-                for w in self.workers:
-                    try:
-                        w.wait(2000)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        # 4. 终止参数提取线程
-        try:
-            if hasattr(self, 'extractors'):
-                for ext in list(self.extractors):
-                    try:
-                        ext.stop()
-                        ext.wait(500)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        # 5. 兜底：干掉当前进程的所有子进程（含孤儿 Blender）
-        if HAS_PSUTIL:
+        # 3. 先通知所有 worker 别再取任务，再统一停掉它们启动的 Blender
+        workers = list(getattr(self, 'workers', []) or [])
+        for w in workers:
             try:
-                current = psutil.Process(os.getpid())
-                children = current.children(recursive=True)
-                for child in children:
-                    try:
-                        child.kill()
-                    except Exception:
-                        pass
-                psutil.wait_procs(children, timeout=2)
+                w.is_running = False
+            except Exception:
+                pass
+        # 并行处理：先统一投递 CTRL_BREAK 快速结束，超时后再强杀整棵进程树
+        terminate_all_tracked_processes(grace=1.0, force_timeout=4.0)
+
+        # 4. 回收管道句柄并等线程结束（全部带超时，绝不无限等）
+        for w in workers:
+            release_process_handles(getattr(w, 'current_process', None))
+            try:
+                w.wait(1500)
+            except Exception:
+                pass
+        for ext in list(getattr(self, 'extractors', []) or []):
+            try:
+                ext.wait(500)
+            except Exception:
+                pass
+            try:
+                ext.stop()
             except Exception:
                 pass
 
-        # 6. 保存状态
+        # 5. 兜底：再扫一遍，干掉任何还挂在名下的 Blender 子进程（含孤儿）
+        terminate_all_tracked_processes(grace=0.0, force_timeout=3.0)
+        sweep_orphan_children()
+
+        # 6. 关掉单实例服务，避免下次启动连到已经死掉的管道上
         try:
-            self.save_session()
+            if _LOCAL_SERVER is not None:
+                _LOCAL_SERVER.close()
+            QLocalServer.removeServer(SERVER_NAME)
+        except Exception:
+            pass
+
+        # 7. 同步保存状态（必须写完再退，不能再用后台线程）
+        try:
+            self.save_session(blocking=True)
             self.save_config()
         except Exception:
             pass
 
-        # 7. 给系统一点缓冲时间
-        time.sleep(0.3)
-        os._exit(0)
+        # 8. 直接结束进程：TerminateProcess 不会等待其它线程收尾，
+        #    万一有线程卡在驱动/管道调用里，也不会残留成关不掉的僵尸进程。
+        force_exit(0)
 
     def refresh_ui(self):
         if self.task_list.count() != len(self.tasks):
@@ -1511,7 +2117,7 @@ class MainWindow(QMainWindow):
         for i in items:
             t = i.data(Qt.ItemDataRole.UserRole)
             t.status = "Waiting"
-            t.rendered_frames = 0
+            t.set_rendered_frames(())
         self.refresh_ui()
         self.on_selection_changed()
 
@@ -1525,7 +2131,7 @@ class MainWindow(QMainWindow):
         for i in items:
             t = i.data(Qt.ItemDataRole.UserRole)
             t.status = "Waiting"
-            t.rendered_frames = 0
+            t.set_rendered_frames(())
             self.start_param_extraction(t)
         self.refresh_ui()
         self.on_selection_changed()
@@ -1646,7 +2252,9 @@ class MainWindow(QMainWindow):
             t = i.data(Qt.ItemDataRole.UserRole)
             if os.path.exists(t.blend_path):
                 try:
-                    subprocess.Popen([self.blender_path, t.blend_path])
+                    proc = subprocess.Popen([self.blender_path, t.blend_path])
+                    # 登记为“用户自己打开的 Blender”：关闭本软件时不去动它
+                    track_process(proc, detached=True)
                     launched += 1
                 except Exception as e:
                     self.append_log(f"❌ 打开工程失败: {e}")
@@ -1728,10 +2336,32 @@ class MainWindow(QMainWindow):
                     QMessageBox.critical(self, self.tr("error"), self.tr("custom_frames_err_box").format(name=task.name))
                     return
 
+        skipped_total = 0
+        blind_tasks = []
         for task in valid_tasks:
+            # 重新进入渲染队列时清掉上一次的错误信息，
+            # 否则上一次失败过的任务这次渲染成功也会被标成“渲染出错”。
+            task.error_msg = ""
             if task.status in ["Failed", "Stopped"]:
                 task.status = "Waiting"
-                task.rendered_frames = 0
+
+            # 输出目录里已经渲染好的帧，Blender 这次会直接跳过。
+            # 不管是“停止后续渲”，还是重新导入工程/重置状态后再次开始，
+            # 这些帧都必须计入总渲染进度，否则进度会一直停在 0%。
+            existing = scan_existing_frames(task)
+            if existing:
+                task.set_rendered_frames(existing)
+                skipped_total += len(existing)
+            else:
+                files, samples = inspect_output_dir(task)
+                if files > 0:
+                    blind_tasks.append((task.name, samples))
+
+        if skipped_total > 0:
+            self.append_log(self.tr("log_resume_progress").format(count=skipped_total))
+        for name, samples in blind_tasks[:3]:
+            self.append_log(self.tr("log_scan_failed").format(
+                name=name, samples=", ".join(samples) if samples else "-"))
 
         if self.log_out.toPlainText().strip():
             self.log_out.append("\n\n" + "—" * 40 + "\n")
@@ -1740,14 +2370,13 @@ class MainWindow(QMainWindow):
         ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
         self.btn_start.hide()
         self.btn_stop.show()
-        if hasattr(self, 'progress_bar'):
-            self.progress_bar.setValue(0)
+        # 进度条交给 update_stat 按“已渲染 / 总帧数”重新计算，重新开始时不再归零
+        self.update_stat()
         self.batch_start_time = time.time()
         self.last_frame_time = time.time()
         self.cached_avg_time_str = "--h--m--s"
         self.cached_eta_str = "--h--m--s"
 
-        # 构建任务队列
         task_queue = queue.Queue()
         for t in valid_tasks:
             task_queue.put(t)
@@ -1803,60 +2432,39 @@ class MainWindow(QMainWindow):
         cost_seconds = int(now - getattr(self, 'last_frame_time', now))
         self.last_frame_time = now
         time_str = self.format_time_str(cost_seconds)
-        task.rendered_frames += 1
+        # 按帧号去重统计：磁盘上已存在（被 Blender 跳过）或之前已统计过的帧不会重复计数
+        task.mark_frame_done(real_frame_num)
         time_up_to_now = now - getattr(self, 'batch_start_time', now)
 
         total_frames = 0
         rendered_frames = 0
         for t in self.tasks:
             if t.load_status == "Success":
-                cf = getattr(t, 'custom_frames', '').strip()
-                if cf:
-                    t_total = len([f for f in cf.split(',') if f.strip().isdigit()])
-                else:
-                    t_total = math.ceil((t.frame_end - t.frame_start + 1) / t.frame_step)
+                t_total = count_task_frames(t)
                 total_frames += t_total
                 if t.status == "Completed":
                     rendered_frames += t_total
                 else:
-                    rendered_frames += getattr(t, 'rendered_frames', 0)
+                    rendered_frames += min(getattr(t, 'rendered_frames', 0), t_total)
 
         if rendered_frames > 0:
             self.cached_avg_time_str = self.format_time_str(cost_seconds)
             try:
-                out_path = task.output_path
-                dir_name = os.path.dirname(out_path)
-                base_name = os.path.basename(out_path)
-                existing_frames = 0
-                if os.path.exists(dir_name):
-                    for file in os.listdir(dir_name):
-                        if file.startswith(base_name):
-                            suffix = file[len(base_name):]
-                            if re.match(r'^\d+', suffix):
-                                existing_frames += 1
-                
                 total_remaining = 0
                 for t in self.tasks:
                     if t.load_status == "Success" and t.status != "Completed":
-                        cf = getattr(t, 'custom_frames', '').strip()
-                        if cf:
-                            t_total = len([f for f in cf.split(',') if f.strip().isdigit()])
-                        else:
-                            t_total = math.ceil((t.frame_end - t.frame_start + 1) / t.frame_step)
-                        
-                        if t == task:
-                            total_remaining += max(0, t_total - existing_frames)
-                        else:
-                            total_remaining += max(0, t_total - getattr(t, 'rendered_frames', 0))
-                
+                        t_total = count_task_frames(t)
+                        total_remaining += max(0, t_total - min(getattr(t, 'rendered_frames', 0), t_total))
+
                 eta = total_remaining * cost_seconds
                 self.cached_eta_str = self.format_time_str(eta)
             except Exception:
-                eta = (total_frames - rendered_frames) * cost_seconds
+                eta = max(0, total_frames - rendered_frames) * cost_seconds
                 self.cached_eta_str = self.format_time_str(eta)
 
         task_idx = self.tasks.index(task) + 1
-        msg = self.tr("log_frame_done").format(idx=task_idx, frame=real_frame_num, time_str=time_str)
+        frame_label = str(real_frame_num).strip() or str(getattr(task, 'rendered_frames', 0))
+        msg = self.tr("log_frame_done").format(idx=task_idx, frame=frame_label, time_str=time_str)
         self.append_log(msg)
         self.update_stat()
 
@@ -1917,21 +2525,27 @@ class MainWindow(QMainWindow):
         self.on_selection_changed()
 
     def stop_render(self):
-        for w in getattr(self, 'workers', []) or []:
+        workers = list(getattr(self, 'workers', []) or [])
+        for w in workers:
             w.is_running = False
-            if w.current_process:
-                try:
-                    w.kill_process_tree(w.current_process.pid)
-                except Exception:
-                    pass
             if w.current_rendering_task:
                 w.current_rendering_task.status = "Stopped"
 
-        for w in getattr(self, 'workers', []) or []:
+        # 并行停止：先统一投递 CTRL_BREAK 快速结束，超时后再强杀整棵进程树，
+        # 避免残留在显卡驱动里变成关不掉的僵尸进程。
+        stop_processes([getattr(w, 'current_process', None) for w in workers],
+                       grace=1.2, force_timeout=4.0)
+
+        for w in workers:
             try:
-                w.wait(3000)
+                w.wait(2000)
             except Exception:
                 pass
+            release_process_handles(getattr(w, 'current_process', None))
+
+        # 兜底：再确认一次（独立进程模式下 worker 可能刚又拉起了一个 Blender）
+        stop_processes([getattr(w, 'current_process', None) for w in workers],
+                       grace=0.0, force_timeout=3.0)
 
         self.append_log(self.tr("log_stopped"))
         self.is_rendering = False
@@ -1946,6 +2560,7 @@ class MainWindow(QMainWindow):
         self.btn_stop.hide()
         self.refresh_ui()
         self.on_selection_changed()
+        self.save_session()
 
     def copy_task(self):
         items = self.task_list.selectedItems()
@@ -1953,7 +2568,7 @@ class MainWindow(QMainWindow):
             old_t = i.data(Qt.ItemDataRole.UserRole)
             nt = copy.deepcopy(old_t)
             nt.status = "Waiting"
-            nt.rendered_frames = 0
+            nt.set_rendered_frames(())
             self.tasks.append(nt)
         self.refresh_ui()
         self.save_session()
@@ -2015,23 +2630,25 @@ class MainWindow(QMainWindow):
                 self.current_lang = "zh"
                 self.blender_path = ""
 
+    def count_existing_frames(self, task):
+        """统计当前任务在磁盘上已经渲染好的帧数（用于“总渲染进度”）。
+        只统计任务帧范围内的帧，所以换过输出目录 / 有其它文件也不会算错。"""
+        return len(scan_existing_frames(task))
+
     def update_stat(self):
         total_frames = 0
         rendered_frames = 0
         completed_tasks = 0
         for t in self.tasks:
             if t.load_status == "Success":
-                cf = getattr(t, 'custom_frames', '').strip()
-                if cf:
-                    task_total_frames = len([f for f in cf.split(',') if f.strip().isdigit()])
-                else:
-                    task_total_frames = math.ceil((t.frame_end - t.frame_start + 1) / t.frame_step)
+                task_total_frames = count_task_frames(t)
                 total_frames += task_total_frames
                 if t.status == "Completed":
                     rendered_frames += task_total_frames
                     completed_tasks += 1
                 else:
-                    rendered_frames += getattr(t, 'rendered_frames', 0)
+                    # 已渲染帧数按帧号去重，且不会超过任务总帧数
+                    rendered_frames += min(getattr(t, 'rendered_frames', 0), task_total_frames)
 
         self.stat_label.setText(self.tr("total_frames_tip").format(
             total=total_frames,
@@ -2040,12 +2657,16 @@ class MainWindow(QMainWindow):
             completed=completed_tasks
         ))
 
-        if total_frames > 0:
-            pct = int((rendered_frames / total_frames) * 100)
-            if hasattr(self, 'progress_bar'):
-                self.progress_bar.setValue(min(100, pct))
-        else:
-            if hasattr(self, 'progress_bar'):
+        if hasattr(self, 'progress_bar'):
+            if total_frames > 0:
+                pct = min(100.0, rendered_frames / total_frames * 100)
+                self.progress_bar.setValue(int(pct))
+                # 帧数上万时整数百分比会长时间停在 0%，这里保留一位小数
+                fmt = self.tr("total_progress")
+                if "%p%" in fmt:
+                    fmt = fmt.replace("%p%", f"{pct:.1f}")
+                self.progress_bar.setFormat(fmt)
+            else:
                 self.progress_bar.setValue(0)
 
     def append_log(self, text):
@@ -2165,8 +2786,6 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
-    SERVER_NAME = "BlenderBatchRenderer_Pro_SingleInstance"
-
     socket = QLocalSocket()
     socket.connectToServer(SERVER_NAME)
 
@@ -2180,6 +2799,7 @@ if __name__ == "__main__":
     local_server = QLocalServer()
     QLocalServer.removeServer(SERVER_NAME)
     local_server.listen(SERVER_NAME)
+    _LOCAL_SERVER = local_server
 
     win = MainWindow()
 
