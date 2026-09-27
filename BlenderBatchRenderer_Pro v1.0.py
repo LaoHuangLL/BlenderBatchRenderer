@@ -128,6 +128,7 @@ TRANSLATIONS = {
         "denoising": "正在降噪...",
         "log_resume_progress": "检测到 {count} 个已经渲染好的帧，已计入总渲染进度（Blender 会自动跳过这些帧）。",
         "log_scan_failed": "⚠️ 任务 “{name}” 的输出目录里有文件，但没能识别出已渲染的帧（示例文件：{samples}）。该任务进度会从 0 开始，请确认“输出路径”和帧文件命名是否一致。",
+        "log_finalize_watchdog": "✅ 渲染已全部完成，但 Blender 进程没有自行退出（可能卡在收尾阶段），已自动结束该进程并继续。",
     },
     "en": {
         "title": "Blender Batch Renderer Pro | By 舟午YueMoon",
@@ -210,6 +211,7 @@ TRANSLATIONS = {
         "denoising": "Denoising...",
         "log_resume_progress": "Detected {count} already rendered frames, they are counted into the total progress (Blender will skip them).",
         "log_scan_failed": "⚠️ Task \"{name}\" has files in its output folder but no rendered frames were recognized (sample files: {samples}). Its progress starts from 0; please check the output path and the frame file naming.",
+        "log_finalize_watchdog": "✅ Render finished, but the Blender process did not exit on its own (it may be stuck while wrapping up). It was terminated automatically, continuing.",
     }
 }
 
@@ -411,6 +413,18 @@ def inspect_output_dir(task, sample_limit=3):
 def count_output_dir_files(task):
     """输出目录里有多少个条目（诊断用）。"""
     return inspect_output_dir(task)[0]
+
+
+def task_frames_present_on_disk(task):
+    """任务范围内的帧是否都已经在磁盘上了。
+
+    看门狗收尾前的最后一道确认：只有“该渲的帧全都在盘上”才敢结束迟迟不退出的进程，
+    避免误杀一个正在慢慢渲染（只是暂时没有输出）的 Blender。
+    """
+    expected = get_task_frame_numbers(task)
+    if not expected:
+        return False
+    return len(scan_existing_frames(task)) >= len(expected)
 
 
 # ---------------------------------------------------------------------------
@@ -713,6 +727,32 @@ def force_exit(code=0):
     os._exit(code)
 
 
+# 最后一帧渲完之后，Blender 偶尔不会自行退出（卡在收尾 / 显卡驱动阶段），
+# 这时不再无限等待，超过这个时间就主动结束它，让批次能正常收尾。
+RENDER_FINALIZE_GRACE = 45.0
+
+
+def reached_last_frame(frame_label, last_frame):
+    """日志里的帧号是否已经到达任务的最后一帧。"""
+    if last_frame is None:
+        return False
+    try:
+        return int(str(frame_label).strip()) >= int(last_frame)
+    except (TypeError, ValueError):
+        return False
+
+
+def should_finalize_lingering_process(proc, finished_at, grace=RENDER_FINALIZE_GRACE, now=None):
+    """渲染已经结束、但进程迟迟不退出时，是否该主动结束它。"""
+    if proc is None or finished_at is None:
+        return False
+    if _process_exited(proc):
+        return False
+    if now is None:
+        now = time.time()
+    return (now - finished_at) >= grace
+
+
 class MyDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):
         if option.state & QStyle.StateFlag.State_HasFocus:
@@ -957,6 +997,7 @@ class RenderWorker(QThread):
     frame_done = pyqtSignal(object, str)
     sample_updated = pyqtSignal(int, int, str)
     worker_finished = pyqtSignal()
+    notice = pyqtSignal(str)   # 需要写进界面日志的提示（传翻译键）
 
     def __init__(self, task_queue, blender_path):
         super().__init__()
@@ -1032,6 +1073,8 @@ except Exception as e:
                         args.extend(["-S", task.scene_name])
                     args.extend(["-P", temp_script, "-f", f_val])
                     process_args_list.append(args)
+                # 独立进程模式：每个进程只负责一帧
+                process_last_frames = [int(f) for f in frame_list]
             else:
                 args = [self.blender_path, "-b", task.blend_path]
                 if task.scene_name:
@@ -1043,8 +1086,9 @@ except Exception as e:
                 else:
                     args.append("-a")
                 process_args_list.append(args)
+                process_last_frames = [max((int(f) for f in frame_list), default=None)]
 
-            for args in process_args_list:
+            for args, process_last_frame in zip(process_args_list, process_last_frames):
                 if not self.is_running:
                     break
 
@@ -1080,14 +1124,27 @@ except Exception as e:
 
                 line_buf = bytearray()
                 frame_max_current = 0
+                # 本进程“渲染已结束”的时刻：最后一帧渲完、或 Blender 播报退出时记录
+                render_finished_at = None
+                last_finalize_check = 0.0
+                ended_by_watchdog = False
 
                 while self.is_running:
                     try:
                         byte_char = q.get(timeout=0.1)
                     except queue.Empty:
-                        
                         if self.current_process.poll() is not None:
                             break
+                        # 渲染已结束但 Blender 迟迟不退出：确认帧都落盘了再主动收尾
+                        if should_finalize_lingering_process(self.current_process, render_finished_at):
+                            now = time.time()
+                            if now - last_finalize_check >= 10.0:
+                                last_finalize_check = now
+                                if task_frames_present_on_disk(task):
+                                    ended_by_watchdog = True
+                                    self.notice.emit("log_finalize_watchdog")
+                                    terminate_process_tree(self.current_process, grace=0.0)
+                                    break
                         continue
 
                     
@@ -1105,6 +1162,9 @@ except Exception as e:
                         line_buf.clear()
                         if not clean_line:
                             continue
+
+                        if "Blender quit" in clean_line:
+                            render_finished_at = time.time()
 
                         lower_line = clean_line.lower()
                         if "denoising" in lower_line or "降噪" in lower_line:
@@ -1166,6 +1226,10 @@ except Exception as e:
                                 if match:
                                     frame_num = match[-1]
 
+                            # 最后一帧已渲完：从这里开始计时，用于兜底结束不退出进程
+                            if reached_last_frame(frame_num, process_last_frame):
+                                render_finished_at = time.time()
+
                             # 解析不出帧号时传空，由主线程挑一个还没统计的帧号，保证进度照常推进
                             self.frame_done.emit(task, frame_num if frame_num is not None else "")
                             frame_max_current = 0
@@ -1177,7 +1241,8 @@ except Exception as e:
                     if not _wait_process_exit(self.current_process, 5.0):
                         terminate_process_tree(self.current_process, grace=0.0)
                     rc = self.current_process.poll()
-                    if rc not in (0, None) and self.is_running:
+                    # 看门狗主动结束的进程不算渲染失败
+                    if rc not in (0, None) and self.is_running and not ended_by_watchdog:
                         if not getattr(task, 'error_msg', ''):
                             task.error_msg = f"Blender进程异常退出 (退出码: {rc})。\n请查看右侧日志了解详情！"
                         break
@@ -2398,6 +2463,7 @@ class MainWindow(QMainWindow):
             w.frame_done.connect(self.on_frame_done)
             w.sample_updated.connect(self.update_frame_progress)
             w.worker_finished.connect(self.on_worker_finished)
+            w.notice.connect(self.on_worker_notice)
             self.workers.append(w)
 
         for w in self.workers:
@@ -2411,6 +2477,13 @@ class MainWindow(QMainWindow):
         self.active_workers = getattr(self, 'active_workers', 1) - 1
         if self.active_workers <= 0:
             self.on_all_done()
+
+    def on_worker_notice(self, tr_key):
+        """worker 里的提示（以翻译键传递）。"""
+        try:
+            self.append_log(self.tr(tr_key))
+        except Exception:
+            pass
 
     def update_frame_progress(self, current, total, format_str=""):
         if format_str == "DENOISING":
