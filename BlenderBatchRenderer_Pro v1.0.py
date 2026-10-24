@@ -10,7 +10,6 @@ import math
 import ctypes
 import threading
 import queue
-import signal
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QListWidgetItem, QPushButton, QLabel, QLineEdit,
@@ -95,6 +94,7 @@ TRANSLATIONS = {
         "status_failed": "渲染出错",
         "status_loading": "加载中",
         "close_warning": "当前存在渲染任务，请停止渲染后再关闭本软件。",
+        "exiting_tip": "正在退出（清理子进程），请稍候…",
         "log_task_start": "开始渲染第 {idx} 个任务，任务名：“{name}”，保存位置：“{path}”",
         "log_frame_done": "完成第 {idx} 任务的第 {frame} 帧，用时 {time_str}",
         "log_missing": "⚠️ 警告：检测到工程中有内容丢失 -> {detail}",
@@ -106,6 +106,7 @@ TRANSLATIONS = {
         "quit_warning_text": "当前存在渲染任务，是否确认停止渲染并退出软件？",
         "confirm_quit": "确认退出",
         "frame_sample": "当前帧采样: %v / %m",
+        "frame_task_prefix": "【任务 {idx}】{text}",
         "total_progress": "总渲染进度: %p%",
         "custom_frames": "自定义帧:",
         "custom_frames_ph": "输入自定义渲染的帧，用英文逗号隔开",
@@ -178,6 +179,7 @@ TRANSLATIONS = {
         "status_failed": "Failed",
         "status_loading": "Loading",
         "close_warning": "There is an active rendering task. Please stop rendering before closing the software.",
+        "exiting_tip": "Exiting (cleaning up processes), please wait…",
         "log_task_start": "Started rendering task: {idx}, Task Name: \"{name}\", Output: \"{path}\"",
         "log_frame_done": "Completed task {idx}, frame {frame}, time taken {time_str}",
         "log_missing": "⚠️ Warning: Missing content detected in project -> {detail}",
@@ -189,6 +191,7 @@ TRANSLATIONS = {
         "quit_warning_text": "Active rendering task exists. Stop rendering and quit?",
         "confirm_quit": "Confirm Quit",
         "frame_sample": "Frame Sampling: %v / %m",
+        "frame_task_prefix": "[Task {idx}] {text}",
         "total_progress": "Total Progress: %p%",
         "custom_frames": "Custom Frames:",
         "custom_frames_ph": "Enter custom frames, separated by commas",
@@ -235,12 +238,21 @@ SESSION_FILE = "BlenderBatchRenderer_session.json"
 SERVER_NAME = "BlenderBatchRenderer_Pro_SingleInstance"
 _LOCAL_SERVER = None
 
-# 子进程（Blender）不显示控制台窗口；同时让它成为新进程组的组长，
-# 这样停止渲染时可以定向投递 CTRL_BREAK：比 taskkill 轻量（不起额外进程），
-# 进程若自己处理该信号就能借机收尾，否则按系统默认行为被立即结束。
-# 注意：实测 Blender 后台模式只注册了 SIGINT（唯一目标是当前控制台的前台进程组，
-# 无法定向投递），不处理 SIGBREAK，所以这一步对 Blender 相当于“立即终止”，
-# 真正的兜底仍然是后面的 taskkill /F /T + psutil 递归清理。
+
+def write_config_to_disk(config_data):
+    """写配置文件（纯数据，可在任意线程调用）。"""
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config_data, f)
+    except Exception:
+        pass
+
+
+# 子进程（Blender）不显示控制台窗口；同时让它成为新进程组的组长。
+# 保留 CREATE_NEW_PROCESS_GROUP 只是因为它是既有的启动参数，停止渲染时不再依赖
+# 控制台信号 CTRL_BREAK：实测 Blender 后台模式不处理 SIGBREAK，投递它等于“立即
+# 终止”，还要搭上 FreeConsole/AttachConsole 的风险（会干扰本程序自己的控制台），
+# 收益为零。现在的停止路径是：限时等待 -> psutil 递归结束整棵进程树。
 BLENDER_CREATE_FLAGS = (
     getattr(subprocess, "CREATE_NO_WINDOW", 0)
     | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -470,6 +482,22 @@ def _wait_process_exit(proc, timeout, interval=0.05):
         time.sleep(interval)
 
 
+def _winapi(dll, name, argtypes, restype):
+    """给 Win32 函数声明正确的签名。
+
+    ctypes 不声明 argtypes/restype 时会按 C 的 int 处理：64 位句柄会被截断成
+    32 位，调用直接失败（返回 0）却不报错。这类「静默失败」在退出路径上是致命的
+    —— 你以为是强杀了，其实什么也没做。
+    """
+    try:
+        func = getattr(dll, name)
+        func.argtypes = argtypes
+        func.restype = restype
+        return func
+    except Exception:
+        return None
+
+
 def _pid_alive(pid):
     if not pid or pid <= 0:
         return False
@@ -479,96 +507,279 @@ def _pid_alive(pid):
         except Exception:
             return False
     try:
-        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
+        kernel32 = ctypes.windll.kernel32
+        # 这里同样必须声明签名：否则 64 位句柄会被截断，判断结果不可信
+        open_process = _winapi(kernel32, "OpenProcess",
+                               [ctypes.c_uint, ctypes.c_int, ctypes.c_uint], ctypes.c_void_p)
+        close_handle = _winapi(kernel32, "CloseHandle", [ctypes.c_void_p], ctypes.c_bool)
+        if open_process is None or close_handle is None:
+            return False
+        handle = open_process(0x1000, False, int(pid))   # PROCESS_QUERY_LIMITED_INFORMATION
         if not handle:
             return False
-        ctypes.windll.kernel32.CloseHandle(handle)
+        close_handle(handle)
         return True
     except Exception:
         return False
 
 
-def _cancel_pending_pipe_io(stream):
-    """取消管道上挂起的读操作，防止读取线程永远卡在 ReadFile 里。"""
+_KERNEL32 = None
+try:
+    _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _KERNEL32.PeekNamedPipe.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong,
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p,
+    ]
+    _KERNEL32.PeekNamedPipe.restype = ctypes.c_bool
+except Exception:
+    _KERNEL32 = None
+
+
+def _pipe_probe_handle(stream):
+    """取管道的系统句柄；取不到返回 None。"""
     try:
         import msvcrt
         handle = msvcrt.get_osfhandle(stream.fileno())
         if handle and handle != -1:
-            ctypes.windll.kernel32.CancelIoEx(ctypes.c_void_p(handle), None)
+            return int(handle)
     except Exception:
         pass
+    return None
 
 
-def release_process_handles(proc):
-    """关闭子进程的管道并回收句柄。
-    若这里不处理，读取线程可能阻塞在 ReadFile 上，导致本程序退出时卡死。"""
+class _PipePoller:
+    """非阻塞读取子进程的 stdout 管道（Windows：PeekNamedPipe 轮询）。
+
+    以前的写法是「单开一个线程 read(1) 死等 + 退出时 CancelIoEx 再 close 那个句柄」，
+    这里有两个真实隐患：
+
+      1) 同步管道（Python 的 open/pipe 句柄不是 OVERLAPPED 打开的）上的 ReadFile
+         卡住以后，CancelIoEx 是取消不掉的 —— 它只对异步 I/O 有效。于是那个读线程
+         永远回不来。
+      2) 在另一个线程里 close 一个正在被读的管道句柄，属于未定义行为，可能直接
+         卡在句柄锁上。
+
+    只要进程里有一个线程永远回不来，本程序在退出时就会变成「已决定终止、但终止
+    不完」的悬挂状态，此时再对它 TerminateProcess 就是「拒绝访问」。
+    所以这里改成纯粹的非阻塞轮询：不需要额外线程，退出时也不存在跨线程关句柄。
+    """
+
+    def __init__(self, stream, read_size=65536):
+        self._stream = stream
+        self._handle = None
+        self._queue = None
+        self._thread = None
+        self._read_size = read_size
+        self._eof = False
+        if stream is not None:
+            self._handle = _pipe_probe_handle(stream)
+            if self._handle is None or _KERNEL32 is None:
+                self._start_reader_thread()
+
+    # -- 退路：万一 PeekNamedPipe 用不了，退回「后台线程 + 队列」，对外接口一致 --
+    def _start_reader_thread(self):
+        self._handle = None
+        self._queue = queue.Queue()
+
+        def _reader():
+            while True:
+                try:
+                    chunk = self._stream.read(4096)
+                except Exception:
+                    chunk = b""
+                if not chunk:
+                    self._queue.put(None)
+                    return
+                self._queue.put(chunk)
+
+        self._thread = threading.Thread(target=_reader, daemon=True)
+        self._thread.start()
+
+    def read(self):
+        """返回 bytes；b"" 表示对端已关闭（EOF）；None 表示暂时没有数据。"""
+        if self._eof:
+            return b""
+        if self._queue is not None:
+            try:
+                chunk = self._queue.get_nowait()
+            except queue.Empty:
+                return None
+            if chunk is None:
+                self._eof = True
+            return chunk
+        try:
+            pending = ctypes.c_ulong(0)
+            ok = _KERNEL32.PeekNamedPipe(
+                ctypes.c_void_p(self._handle), None, 0, None,
+                ctypes.byref(pending), None,
+            )
+            if not ok:
+                self._eof = True          # ERROR_BROKEN_PIPE 等：对端已关闭
+                return b""
+            size = int(pending.value)
+            if size <= 0:
+                return None
+            data = os.read(self._stream.fileno(), min(size, self._read_size))
+            if not data:
+                self._eof = True
+            return data
+        except Exception:
+            self._eof = True
+            return b""
+
+    def close(self):
+        """关闭管道句柄。读线程还活着时绝不动这个句柄（不跨线程关正在读的句柄）。"""
+        if self._thread is not None:
+            try:
+                self._thread.join(0.5)
+            except Exception:
+                pass
+            if self._thread.is_alive():
+                # 读线程还卡着：句柄交给它，进程退出时由系统回收，绝不在这里强行 close
+                self._stream = None
+        stream = self._stream
+        self._stream = None
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+
+def release_process_handles(proc, timeout=1.0):
+    """结束残留的子进程（不碰 stdio）。
+
+    管道句柄一律交给读它的那一方自己关闭：跨线程关一个正在被读的句柄，
+    有可能让本程序卡在句柄锁上 —— 这类卡死是「关软件时拒绝访问」的成因之一。
+    """
     if proc is None:
         return
-    stream = getattr(proc, 'stdout', None)
-    if stream is not None:
-        try:
-            _cancel_pending_pipe_io(stream)
-        except Exception:
-            pass
-        try:
-            stream.close()
-        except Exception:
-            pass
     try:
         if proc.poll() is None:
             proc.kill()
     except Exception:
         pass
     try:
-        proc.wait(timeout=1)
+        proc.wait(timeout=timeout)
     except Exception:
         pass
 
 
-def send_graceful_stop(proc):
-    """给子进程定向投递 CTRL_BREAK（比 taskkill 轻量、少一层进程）。
+# 结束子进程的总时间预算（秒）。关软件时宁可留下日志硬退，也绝不允许无限等。
+DEFAULT_KILL_BUDGET = 4.0
 
-    进程若自己处理该信号就能借机收尾；不处理则被系统默认行为立即结束。
-    返回 True 表示事件已投递（不代表进程已经退出）。
+
+def _alive_pids(procs):
+    """这批 Popen 里还有谁活着（返回 PID 列表）。"""
+    alive = []
+    for proc in procs or []:
+        if proc is None or _process_exited(proc):
+            continue
+        pid = getattr(proc, 'pid', None)
+        if pid:
+            alive.append(int(pid))
+    return alive
+
+
+def kill_processes(procs, deadline=None, include_children=True):
+    """限时、批量地结束一批子进程（连同它们的子树）。
+
+    和以前「逐个 taskkill /F /T + 逐个 wait」的区别：
+      * 不再额外 spawn 一个 taskkill 进程（关软件时再启动新进程本身就是风险源）；
+      * psutil 一次处理整棵子树，所有进程共用同一个截止时间，不会 N 个进程各等 4 秒；
+      * 返回「被系统拒绝访问」的 PID，用于在退出日志里说明真相，
+        而不是像原来那样把 Access is denied 悄悄吞掉。
     """
-    pid = getattr(proc, 'pid', None)
-    if not pid or _process_exited(proc):
-        return False
-    ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
-    if ctrl_break is None:
-        return False
-    try:
-        kernel32 = ctypes.windll.kernel32
-    except Exception:
-        return False
+    procs = [p for p in (procs or []) if p is not None]
+    if not procs:
+        return []
+    if deadline is None:
+        deadline = time.time() + DEFAULT_KILL_BUDGET
+    denied = []
+    targets = []
 
-    delivered = False
-    try:
-        kernel32.FreeConsole()
-        if kernel32.AttachConsole(int(pid)):
-            delivered = bool(kernel32.GenerateConsoleCtrlEvent(int(ctrl_break), int(pid)))
-    except Exception:
-        delivered = False
-    finally:
+    if HAS_PSUTIL:
+        for proc in procs:
+            pid = getattr(proc, 'pid', None)
+            if not pid:
+                continue
+            try:
+                parent = psutil.Process(pid)
+            except Exception:
+                continue  # 进程已经不在了，没什么可杀的
+            tree = []
+            if include_children:
+                try:
+                    tree = parent.children(recursive=True)
+                except Exception:
+                    tree = []
+            tree.append(parent)
+            for item in tree:
+                if item in targets:
+                    continue
+                targets.append(item)
+                try:
+                    item.kill()
+                except psutil.NoSuchProcess:
+                    pass
+                except psutil.AccessDenied:
+                    # 进程已经进入系统级「终止中」状态时，连 TerminateProcess 都会被拒。
+                    denied.append(item.pid)
+                except Exception:
+                    pass
+    else:
+        # 没有 psutil 时的退路：一次 taskkill 打完，带超时
+        cmd = ["taskkill", "/F", "/T"]
+        for proc in procs:
+            pid = getattr(proc, 'pid', None)
+            if pid:
+                cmd.extend(["/PID", str(pid)])
+        if len(cmd) > 3:
+            try:
+                subprocess.run(
+                    cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, timeout=2.0,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except Exception:
+                pass
+
+    # Popen 对象自己再兜一次（psutil 里没登到、或者 kill 被拒的场景）
+    for proc in procs:
         try:
-            kernel32.FreeConsole()
+            if proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pid = getattr(proc, 'pid', None)
+            if pid:
+                denied.append(int(pid))
+
+    # 统一等一次，上限是整个 deadline，不逐个累加
+    if targets:
+        try:
+            psutil.wait_procs(targets, timeout=max(0.0, deadline - time.time()))
         except Exception:
             pass
-
-    if not delivered:
+    for proc in procs:
+        left = max(0.0, deadline - time.time())
         try:
-            proc.send_signal(ctrl_break)
-            delivered = True
+            proc.wait(timeout=min(1.0, left) if left > 0 else 0.0)
         except Exception:
             pass
-    return delivered
+        untrack_process(proc)
+    return denied
 
 
 def terminate_process_tree(proc, grace=1.2, force_timeout=4.0):
     """终止子进程及其整棵子树，返回 True 表示已确认退出。
 
-    顺序：优雅中断 -> taskkill /F /T -> psutil 递归清理 -> Popen.kill，
-    每一步都有超时，绝不死等，避免关软件时把自己也拖成僵尸进程。
+    顺序：可选的自然退出等待 -> psutil 递归强杀（含 Popen.kill 兜底）-> 复查。
+    每一步都带时限，绝不死等，避免关软件时把自己也拖成卡死的进程。
+
+    注意：这里不再投递 CTRL_BREAK / 也不再折腾 FreeConsole + AttachConsole。
+    Blender 后台模式并不处理 SIGBREAK（项目里原本的注释也承认这一点），
+    那套 console 操作唯一确定的效果是把本程序自己的控制台 detach 掉，
+    属于「有副作用、没收益」的高风险动作，已经删掉。
     """
     if proc is None:
         return True
@@ -577,110 +788,82 @@ def terminate_process_tree(proc, grace=1.2, force_timeout=4.0):
         return True
 
     if _process_exited(proc):
-        # 已经退出的进程只需要回收句柄，不要再白跑一次 taskkill
         release_process_handles(proc)
         untrack_process(proc)
         return True
 
-    if grace > 0 and not _process_exited(proc):
-        send_graceful_stop(proc)
-        if _wait_process_exit(proc, grace):
-            release_process_handles(proc)
-            untrack_process(proc)
-            return True
-
-    try:
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(pid)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=force_timeout,
-        )
-    except Exception:
-        pass
-    if _wait_process_exit(proc, 1.0):
+    if grace > 0 and _wait_process_exit(proc, grace):
         release_process_handles(proc)
         untrack_process(proc)
         return True
 
-    if HAS_PSUTIL:
-        try:
-            parent = psutil.Process(pid)
-            procs = parent.children(recursive=True)
-            procs.append(parent)
-            for p in procs:
-                try:
-                    p.kill()
-                except Exception:
-                    pass
-            psutil.wait_procs(procs, timeout=force_timeout)
-        except Exception:
-            pass
-
-    try:
-        if not _process_exited(proc):
-            proc.kill()
-    except Exception:
-        pass
-
-    dead = _wait_process_exit(proc, 1.5)
+    kill_processes([proc], deadline=time.time() + max(0.5, float(force_timeout)))
     release_process_handles(proc)
-    untrack_process(proc)
-    return dead
+    return _process_exited(proc)
 
 
 def terminate_process_tree_by_pid(pid, force_timeout=4.0):
     """按 PID 结束整棵进程树（只剩 PID、没有 Popen 对象的场景）。"""
     if not _pid_alive(pid):
         return True
-    try:
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(pid)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=force_timeout,
-        )
-    except Exception:
-        pass
-    if not _pid_alive(pid):
-        return True
+    deadline = time.time() + max(0.5, float(force_timeout))
     if HAS_PSUTIL:
         try:
-            parent = psutil.Process(pid)
-            procs = parent.children(recursive=True)
-            procs.append(parent)
-            for p in procs:
-                try:
-                    p.kill()
-                except Exception:
-                    pass
-            psutil.wait_procs(procs, timeout=force_timeout)
+            parent = psutil.Process(int(pid))
+        except Exception:
+            return True
+        tree = []
+        try:
+            tree = parent.children(recursive=True)
+        except Exception:
+            tree = []
+        tree.append(parent)
+        for item in tree:
+            try:
+                item.kill()
+            except Exception:
+                pass
+        try:
+            psutil.wait_procs(tree, timeout=max(0.0, deadline - time.time()))
+        except Exception:
+            pass
+    else:
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=force_timeout,
+            )
         except Exception:
             pass
     return not _pid_alive(pid)
 
 
-def stop_processes(procs, grace=1.2, force_timeout=4.0):
-    """并行停止一批子进程：先统一优雅中断，再统一强杀（避免逐个等待拖慢响应）。"""
+def stop_processes(procs, grace=0.0, force_timeout=4.0):
+    """限时停止一批子进程，返回被系统拒绝访问 / 仍存活可疑的 PID 列表。"""
     procs = [p for p in (procs or []) if p is not None and not _process_exited(p)]
     if not procs:
-        return
+        return []
+    deadline = time.time() + max(0.2, float(force_timeout))
     if grace > 0:
-        for p in procs:
-            send_graceful_stop(p)
-        deadline = time.time() + grace
-        while time.time() < deadline and any(not _process_exited(p) for p in procs):
+        # 先给一点自然退出的时间（大多数情况这里就走了），再统一强杀
+        grace_deadline = min(deadline, time.time() + float(grace))
+        while time.time() < grace_deadline and any(not _process_exited(p) for p in procs):
             time.sleep(0.05)
-    for p in procs:
-        terminate_process_tree(p, grace=0.0, force_timeout=force_timeout)
+    return kill_processes(procs, deadline=deadline)
 
 
 def terminate_all_tracked_processes(grace=0.0, force_timeout=4.0):
-    stop_processes(_tracked_processes(), grace=grace, force_timeout=force_timeout)
+    return stop_processes(_tracked_processes(), grace=grace, force_timeout=force_timeout)
 
 
 def sweep_orphan_children(force_timeout=3.0):
-    """兜底：清理仍挂在名下的 Blender 子进程（跳过用户主动打开的 Blender）。"""
+    """兜底：清理仍挂在名下的 Blender 子进程（跳过用户主动打开的 Blender）。
+
+    返回仍然活着的 PID 列表，供退出日志说明「还有东西没死」。
+    """
     if not HAS_PSUTIL:
-        return
+        return []
     protected = set()
     with _TRACK_LOCK:
         for proc in _DETACHED_PROCS:
@@ -690,7 +873,7 @@ def sweep_orphan_children(force_timeout=3.0):
     try:
         children = psutil.Process(os.getpid()).children(recursive=True)
     except Exception:
-        return
+        return []
     victims = []
     for child in children:
         if child.pid in protected:
@@ -706,24 +889,129 @@ def sweep_orphan_children(force_timeout=3.0):
             victim.kill()
         except Exception:
             pass
+    survivors = []
     if victims:
         try:
-            psutil.wait_procs(victims, timeout=force_timeout)
+            _, alive = psutil.wait_procs(victims, timeout=max(0.5, float(force_timeout)))
+            survivors = [p.pid for p in alive]
         except Exception:
             pass
+    return survivors
 
 
-def force_exit(code=0):
-    """立即结束本进程。
+EXIT_LOG_FILE = "BlenderBatchRenderer_exit.log"
+_EXIT_LOG_LOCK = threading.Lock()
 
-    用 TerminateProcess 而不是 os._exit：ExitProcess 会等待其它线程收尾，
-    一旦有线程卡在驱动 / 管道调用里，进程就会残留成关不掉的僵尸进程。
+# 退出流程的两个硬指标：
+#   SHUTDOWN_KILL_BUDGET —— 后台线程清理子进程的预算
+#   SHUTDOWN_HARD_LIMIT  —— 无论如何都必须结束本进程的硬上限
+# 几个预算相加（0.3 + 2.5 + 1.2 + 1.2 + 1.2 ≈ 6.4s）要明显小于硬上限。
+SHUTDOWN_KILL_BUDGET = 2.5
+SHUTDOWN_HARD_LIMIT = 9.0
+
+
+def _exit_log_paths():
+    """退出日志的候选路径（同时写多处，事后总能找到其中一个）。
+
+    当前目录不一定是程序所在目录：PyInstaller onedir 打包后从资源管理器双击
+    启动时 CWD 可能是任意位置，所以外加 exe 所在目录和 %TEMP%。
     """
+    paths = [os.path.abspath(EXIT_LOG_FILE)]
     try:
-        kernel32 = ctypes.windll.kernel32
-        kernel32.TerminateProcess(kernel32.GetCurrentProcess(), code)
+        if getattr(sys, 'frozen', False):
+            app_dir = os.path.dirname(os.path.abspath(sys.executable))
+        else:
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+        cand = os.path.join(app_dir, EXIT_LOG_FILE)
+        if cand not in paths:
+            paths.append(cand)
     except Exception:
         pass
+    try:
+        tmp = os.environ.get("TEMP") or os.environ.get("TMP")
+        if tmp:
+            cand = os.path.join(tmp, EXIT_LOG_FILE)
+            if cand not in paths:
+                paths.append(cand)
+    except Exception:
+        pass
+    return paths
+
+
+def log_exit(message):
+    """退出流程的极简日志（带时间戳，同时写当前目录 / 程序目录 / TEMP）。
+
+    这类「关闭时卡住 / 拒绝访问」的问题和环境强相关，事后没有现场就只能靠猜。
+    留一条带时间戳的记录，下次直接能看出是哪一步慢、哪个 PID 被拒绝访问。
+    写文件不经过显卡驱动，因此即使某个线程卡在驱动里，这些记录照样能落盘。
+    """
+    try:
+        line = "[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), message)
+        with _EXIT_LOG_LOCK:
+            for path in _exit_log_paths():
+                try:
+                    if os.path.exists(path) and os.path.getsize(path) > 256 * 1024:
+                        os.remove(path)
+                    with open(path, "a", encoding="utf-8") as f:
+                        f.write(line)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _terminate_self(code):
+    """用 TerminateProcess 结束自己，返回 (是否成功, 失败时的 Win32 错误码)。
+
+    错误码非常关键：
+      5  = ERROR_ACCESS_DENIED   -> 本进程已经在「终止中」，外部强杀同样会得到它
+      6  = ERROR_INVALID_HANDLE  -> 签名/句柄问题（旧代码就是悄悄踩在这个上）
+      其它 -> 原样记进退出日志
+    """
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_current = _winapi(kernel32, "GetCurrentProcess", [], ctypes.c_void_p)
+        terminate = _winapi(kernel32, "TerminateProcess",
+                            [ctypes.c_void_p, ctypes.c_uint], ctypes.c_bool)
+        if get_current is None or terminate is None:
+            return False, -1
+        if terminate(get_current(), int(code)):
+            return True, 0
+        return False, ctypes.get_last_error()
+    except Exception as exc:
+        return False, -2
+
+
+def force_exit(code=0, why=""):
+    """立即结束本进程。
+
+    优先用 TerminateProcess：它跳过 ExitProcess 的逐 DLL 卸载通知
+    （Qt、显卡驱动都在 DllMain 里做收尾，那一步是最容易死锁的地方），
+    而死锁的后果就是进程卡在「终止中」状态 —— 之后连任务管理器的「结束任务」
+    都会报「拒绝访问」。
+
+    注意这里是**真的**调用了 TerminateProcess（带正确签名）。旧代码没有声明
+    argtypes，GetCurrentProcess() 返回的伪句柄被截断成 32 位，TerminateProcess
+    实际返回失败（错误码 6/无效句柄）却没有检查，于是每次都悄悄退化成了
+    os._exit() —— 也就是回到了它本想避开的 ExitProcess 路径。已实测确认并修好。
+
+    另外：正常路径下一定从 GUI 主线程调用（见 _final_exit_if_ready）。
+    ExitProcess 从非主线程调用会去抢加载器锁，而主线程此刻正待在 Qt 事件循环里，
+    那是一个真实的死锁点。
+
+    说明 2：如果真有线程卡在显卡驱动的内核态等待里，任何用户态手段都结束不了它
+    （Windows 的限制，只能重启）。所以这里的职责是：第一不要让自己成为那种进程，
+    第二万一变成了，也要在退出日志里留下证据 —— 就是下面那行日志。
+    """
+    ok, err = _terminate_self(code)
+    # 能执行到这一行，说明 TerminateProcess 并没有结束本进程 —— 这本身就是最重要的证据
+    log_exit(
+        "TerminateProcess(%r) 返回 %r / 错误码 %r，但本进程仍然存活（调用点：%s）；"
+        "存活线程：%s。"
+        "错误码 5=ERROR_ACCESS_DENIED 表示本进程已在「终止中」，"
+        "错误码其它值或仍存活通常意味着有线程卡在内核态（多半是显卡驱动）。"
+        % (code, ok, err, why or "未知",
+           ", ".join(sorted({t.name for t in threading.enumerate()}))))
     os._exit(code)
 
 
@@ -785,7 +1073,49 @@ class RenderTask:
         # 已渲染帧号集合：既有磁盘上已存在（Blender 会跳过）的帧，
         # 也有本次新渲出来的帧，用来自动去重，保证进度只增不减、不会重复计算。
         self.rendered_frame_set = set()
+        # 计时（只用于运行期统计，不写进会话文件）：
+        # 并行渲染时多个任务同时上报帧，必须按任务各算各的，否则会互相串台。
+        self.rendering_started_at = 0.0   # 本任务本次开始渲染的时间
+        self.last_frame_time = 0.0        # 本任务上一帧完成的时间
+        self.frame_time_total = 0.0       # 本任务累计帧耗时
+        self.frame_time_count = 0         # 本任务计时过的帧数
         self.scene_data = {}
+
+    def note_frame_rendered(self, now=None):
+        """记录本任务完成了一帧，返回这一帧的耗时（秒）。"""
+        now = time.time() if now is None else now
+        # 时间戳为 0 表示“还没记录过”，这里显式判断，不用真值判断（0.0 会被当成假）
+        if self.last_frame_time > 0:
+            base = self.last_frame_time
+        elif self.rendering_started_at > 0:
+            base = self.rendering_started_at
+        else:
+            base = now
+        cost = max(0.0, now - base)
+        self.last_frame_time = now
+        self.frame_time_total += cost
+        self.frame_time_count += 1
+        return cost
+
+    def average_frame_time(self):
+        """本任务的平均单帧耗时（秒），还没测到返回 0。"""
+        if self.frame_time_count <= 0:
+            return 0.0
+        return self.frame_time_total / self.frame_time_count
+
+    def seconds_since_last_frame(self, now=None):
+        """本任务距离上一帧完成过去了多久（用于显示“当前帧”）"""
+        if self.last_frame_time <= 0:
+            return 0.0
+        now = time.time() if now is None else now
+        return max(0.0, now - self.last_frame_time)
+
+    def reset_timing(self, now=None):
+        now = time.time() if now is None else now
+        self.rendering_started_at = now
+        self.last_frame_time = 0.0
+        self.frame_time_total = 0.0
+        self.frame_time_count = 0
 
     def set_rendered_frames(self, frames):
         """用一批帧号重置进度（例如开始渲染前扫描磁盘得到的结果）。"""
@@ -928,7 +1258,15 @@ except Exception as e:
                 stdout_data, _ = self.proc.communicate(timeout=30)
                 rc = self.proc.returncode
             except subprocess.TimeoutExpired:
-                terminate_process_tree(self.proc, grace=0.8)
+                proc = self.proc
+                terminate_process_tree(proc, grace=0.8)
+                # communicate() 超时后，它内部负责读管道的线程还活着。
+                # 必须再 communicate 一次把这些线程收掉（顺带关闭管道），
+                # 否则后面任何对 stdout 的操作都会变成跨线程关句柄 —— 可能卡死。
+                try:
+                    proc.communicate(timeout=1.0)
+                except Exception:
+                    pass
                 self.proc = None
                 self.task.load_status = "Failed"
                 self.task.error_msg = "参数提取超时 (30s)"
@@ -995,7 +1333,7 @@ class RenderWorker(QThread):
     status_updated = pyqtSignal(object, str)
     log_updated = pyqtSignal(str)
     frame_done = pyqtSignal(object, str)
-    sample_updated = pyqtSignal(int, int, str)
+    sample_updated = pyqtSignal(object, int, int, str)   # (任务, 当前, 总数, 标识)
     worker_finished = pyqtSignal()
     notice = pyqtSignal(str)   # 需要写进界面日志的提示（传翻译键）
 
@@ -1026,6 +1364,7 @@ class RenderWorker(QThread):
 
     def render_single_task(self, task):
         temp_script = None
+        poller = None
         try:
             # 注意：这里不能把 rendered_frames 归零。
             # 上一次停止渲染前已经落盘的帧（Blender 这次会跳过）必须保留在进度里，
@@ -1092,6 +1431,11 @@ except Exception as e:
                 if not self.is_running:
                     break
 
+                # 独立进程模式每帧一个新进程：上一轮的管道句柄在这里收掉，避免句柄泄漏
+                if poller is not None:
+                    poller.close()
+                    poller = None
+
                 self.current_process = subprocess.Popen(
                     args, stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1099,19 +1443,9 @@ except Exception as e:
                 )
                 track_process(self.current_process)
 
-                q = queue.Queue()
-                def _read_stdout(proc, output_queue):
-                    while True:
-                        try:
-                            b = proc.stdout.read(1)
-                            if not b:
-                                output_queue.put(None)
-                                break
-                            output_queue.put(b)
-                        except Exception:
-                            output_queue.put(None)
-                            break
-                threading.Thread(target=_read_stdout, args=(self.current_process, q), daemon=True).start()
+                # 非阻塞轮询管道（详见 _PipePoller）：这里刻意不再起「读线程死等」，
+                # 否则线程一旦卡在 ReadFile 里，本程序退出时就会变成终止不了的悬挂进程。
+                poller = _PipePoller(self.current_process.stdout)
 
                 if HAS_PSUTIL and getattr(self, 'cpu_pct', 1.0) <= 1.0:
                     try:
@@ -1128,32 +1462,45 @@ except Exception as e:
                 render_finished_at = None
                 last_finalize_check = 0.0
                 ended_by_watchdog = False
+                # 已读出、还没逐个处理的字节（按字节处理是为了保持原有的逐行解析逻辑）
+                pending = b""
+                pending_pos = 0
 
                 while self.is_running:
-                    try:
-                        byte_char = q.get(timeout=0.1)
-                    except queue.Empty:
-                        if self.current_process.poll() is not None:
+                    if pending_pos >= len(pending):
+                        data = poller.read()
+                        if data is None:
+                            # 暂时没有输出：先确认进程是不是已经走了
+                            if self.current_process.poll() is not None:
+                                data = poller.read()
+                                if data is None:
+                                    data = b""
+                            else:
+                                # 渲染已结束但 Blender 迟迟不退出：确认帧都落盘了再主动收尾
+                                if should_finalize_lingering_process(self.current_process, render_finished_at):
+                                    now = time.time()
+                                    if now - last_finalize_check >= 10.0:
+                                        last_finalize_check = now
+                                        if task_frames_present_on_disk(task):
+                                            ended_by_watchdog = True
+                                            self.notice.emit("log_finalize_watchdog")
+                                            terminate_process_tree(self.current_process, grace=0.0)
+                                            break
+                                time.sleep(0.05)
+                                continue
+                        if data == b"":
+                            # 管道关闭（Blender 已退出），把最后半行吐出去就收尾
+                            if line_buf:
+                                clean_line = line_buf.decode('utf-8', errors='replace').strip()
+                                line_buf.clear()
+                                if clean_line:
+                                    self.log_updated.emit(clean_line)
                             break
-                        # 渲染已结束但 Blender 迟迟不退出：确认帧都落盘了再主动收尾
-                        if should_finalize_lingering_process(self.current_process, render_finished_at):
-                            now = time.time()
-                            if now - last_finalize_check >= 10.0:
-                                last_finalize_check = now
-                                if task_frames_present_on_disk(task):
-                                    ended_by_watchdog = True
-                                    self.notice.emit("log_finalize_watchdog")
-                                    terminate_process_tree(self.current_process, grace=0.0)
-                                    break
-                        continue
+                        pending = data
+                        pending_pos = 0
 
-                    
-                    if byte_char is None:
-                        if line_buf:
-                            clean_line = line_buf.decode('utf-8', errors='replace').strip()
-                            if clean_line:
-                                self.log_updated.emit(clean_line)
-                        break
+                    byte_char = pending[pending_pos:pending_pos + 1]
+                    pending_pos += 1
 
                     if byte_char == b'\r' or byte_char == b'\n':
                         if not line_buf:
@@ -1168,7 +1515,7 @@ except Exception as e:
 
                         lower_line = clean_line.lower()
                         if "denoising" in lower_line or "降噪" in lower_line:
-                            self.sample_updated.emit(1, 1, "DENOISING")
+                            self.sample_updated.emit(task, 1, 1, "DENOISING")
 
                         elif "sample" in lower_line or "采样" in lower_line:
                             tile_match = re.search(
@@ -1199,7 +1546,7 @@ except Exception as e:
 
                                     current_tile_index = min(completed_tiles + 1, tot_tile)
                                     format_str = f"TILES:{cur_samp}:{tot_samp}:{current_tile_index}:{tot_tile}"
-                                    self.sample_updated.emit(abs_current, abs_total, format_str)
+                                    self.sample_updated.emit(task, abs_current, abs_total, format_str)
 
                             else:
                                 match = re.search(r'(\d+)\s*/\s*(\d+)', lower_line)
@@ -1211,7 +1558,7 @@ except Exception as e:
                                             cur_samp = frame_max_current
                                         else:
                                             frame_max_current = cur_samp
-                                        self.sample_updated.emit(cur_samp, tot_samp, "")
+                                        self.sample_updated.emit(task, cur_samp, tot_samp, "")
 
                         self.log_updated.emit(clean_line)
 
@@ -1270,6 +1617,14 @@ except Exception as e:
                     untrack_process(proc)
                     release_process_handles(proc)
                 self.current_process = None
+
+            # 管道句柄由本线程自己关（不跨线程关正在读的句柄）
+            if poller is not None:
+                try:
+                    poller.close()
+                except Exception:
+                    pass
+                poller = None
 
             if self.is_running:
                 is_ok = not bool(getattr(task, 'error_msg', ''))
@@ -1336,6 +1691,28 @@ class ActionConfirmDialog(QDialog):
             self.timer.stop()
             self.accept()
         self.tip_label.setText(self.tr("tasks_completed_tip").format(action=self.action_name, countdown=self.countdown))
+
+
+_NVML_LOCK = threading.Lock()
+_NVML_STATE = {"tried": False, "module": None}
+
+
+def _nvml_module():
+    """取得已 nvmlInit() 过的 pynvml 模块（只初始化一次，永不 Shutdown）。
+
+    这是全局单例，多个轮询线程共用同一个已初始化的 NVML 会话；
+    重复 Init/Shutdown 会反复加载/卸载 nvml.dll，是驱动不稳定的常见诱因。
+    """
+    with _NVML_LOCK:
+        if not _NVML_STATE["tried"]:
+            _NVML_STATE["tried"] = True
+            try:
+                import pynvml
+                pynvml.nvmlInit()
+                _NVML_STATE["module"] = pynvml
+            except Exception:
+                _NVML_STATE["module"] = None
+        return _NVML_STATE["module"]
 
 
 class MainWindow(QMainWindow):
@@ -1437,12 +1814,29 @@ class MainWindow(QMainWindow):
         self.workers = []
         self.is_rendering = False
         self._exiting = False
-        self.last_frame_time = time.time()
+        # 计时统一放在每个 RenderTask 上（并行渲染时各任务互不干扰）
         self.batch_start_time = time.time()
-        self.current_task_start_time = time.time()
-        self.cached_avg_time_str = "--h--m--s"
-        self.cached_eta_str = "--h--m--s"
         self._last_disk_rescan = 0.0
+        # 显卡信息在后台线程里取（见 poll_gpu_async）：绝不在 GUI 线程里调显卡驱动。
+        #
+        # 默认关闭，这是有实证依据的决定（2026-10-24 的诊断快照）：
+        # 卡死进程里 threads=1、该线程状态不是 Wait（= 正在内核态里跑，不在等事件）、
+        # handles=1120、窗口已销毁但进程不退 —— 这就是 Windows「终止中」状态的签名：
+        # 内核已经杀掉它所有能杀的线程，只剩一个卡在不可取消的内核调用里的线程。
+        # 同一进程的已加载模块里有 nvml.dll（pynvml 用的就是它），所以那个线程极可能
+        # 就是卡在显卡驱动里的 NVML 调用上。这种线程用户态永远杀不掉，进程只能重启。
+        #
+        # 显卡数字只是「好看」，不值得拿整个程序的可退出性去换。
+        # 需要的话在配置里写 "gpu_monitor": true 显式打开。
+        self._gpu_lock = threading.Lock()
+        self._gpu_info = ("--", "--")
+        self._gpu_polling = False
+        self._gpu_poll_started_at = 0.0
+        self._gpu_poll_slow = False      # 出现过一次「很久没返回」就永久停用显卡监控
+        self.gpu_monitor = False
+        self._shutdown_thread = None
+        self._shutdown_done = threading.Event()
+        self._exit_timer = None
 
         try:
             icon = QIcon(resource_path("favicon.ico"))
@@ -1462,6 +1856,8 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
         self.init_ui()
         self.load_config()
+        log_exit("启动：显卡监控=%r（关闭时不会向显卡驱动发任何查询）" % (
+            getattr(self, 'gpu_monitor', False),))
         self.apply_theme()
         self.retranslate_ui()
         self.load_session()
@@ -1949,18 +2345,26 @@ class MainWindow(QMainWindow):
             return
         if self.is_rendering:
             dialog = QuitConfirmDialog(self, self.tr)
-            if dialog.exec() == QDialog.DialogCode.Accepted:
-                self.stop_render()
-                self.cleanup_and_quit()
-        else:
-            self.cleanup_and_quit()
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+        self.cleanup_and_quit()
 
     def cleanup_and_quit(self):
+        """退出：GUI 线程只做「极快、绝不阻塞」的事，其余全部交给后台线程。
+
+        这就是之前「关闭时拒绝访问 + 系统卡顿 + 只能重启」的直接对策：
+          * GUI 线程绝不去等子进程、等线程、等显卡驱动 —— 一旦它卡住，窗口就
+            变成「未响应」，用户只能在任务管理器里强杀，而强杀一个正在收尾的
+            进程恰好就是「拒绝访问」的来源；
+          * 清理工作全部后台化，并且有总时限；
+          * 无论如何都有一个硬上限，到点直接结束本进程。
+        """
         if getattr(self, '_exiting', False):
             return
         self._exiting = True
+        started = time.time()
 
-        # 1. 停掉所有 Qt 定时器，避免退出过程中资源监视被打断
+        # ---- 1. 停掉 Qt 定时器（必须在 GUI 线程）----
         for timer_name in ('monitor_timer', 'spinner_timer'):
             timer = getattr(self, timer_name, None)
             if timer is not None:
@@ -1969,44 +2373,41 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-        # 2. 复位电源状态（重要！）
+        # ---- 2. 复位电源状态（必须在 GUI 线程、必须做）----
         try:
             ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
         except Exception:
             pass
 
-        # 3. 先通知所有 worker 别再取任务，再统一停掉它们启动的 Blender
+        # ---- 3. 通知 worker 别再取任务，并把渲染中的任务记成“手动停止” ----
         workers = list(getattr(self, 'workers', []) or [])
         for w in workers:
             try:
                 w.is_running = False
             except Exception:
                 pass
-        # 并行处理：先统一投递 CTRL_BREAK 快速结束，超时后再强杀整棵进程树
-        terminate_all_tracked_processes(grace=1.0, force_timeout=4.0)
+            task = getattr(w, 'current_rendering_task', None)
+            if task is not None:
+                task.status = "Stopped"
+        self.is_rendering = False
 
-        # 4. 回收管道句柄并等线程结束（全部带超时，绝不无限等）
-        for w in workers:
-            release_process_handles(getattr(w, 'current_process', None))
-            try:
-                w.wait(1500)
-            except Exception:
-                pass
-        for ext in list(getattr(self, 'extractors', []) or []):
-            try:
-                ext.wait(500)
-            except Exception:
-                pass
-            try:
-                ext.stop()
-            except Exception:
-                pass
+        # ---- 4. 需要落盘的内容在 GUI 线程取好（后台线程不允许碰控件）----
+        payload = None
+        try:
+            payload = {
+                "current_row": self.task_list.currentRow(),
+                "tasks": [t.to_dict() for t in self.tasks],
+                "log_content": self.log_out.toHtml(),
+            }
+        except Exception:
+            payload = None
+        config_data = None
+        try:
+            config_data = self._config_payload()
+        except Exception:
+            config_data = None
 
-        # 5. 兜底：再扫一遍，干掉任何还挂在名下的 Blender 子进程（含孤儿）
-        terminate_all_tracked_processes(grace=0.0, force_timeout=3.0)
-        sweep_orphan_children()
-
-        # 6. 关掉单实例服务，避免下次启动连到已经死掉的管道上
+        # ---- 5. 关掉单实例服务（Qt 对象，仍留在 GUI 线程）----
         try:
             if _LOCAL_SERVER is not None:
                 _LOCAL_SERVER.close()
@@ -2014,16 +2415,139 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # 7. 同步保存状态（必须写完再退，不能再用后台线程）
+        # ---- 6. 窗口立刻进入“正在退出”的可读状态，不会让人以为卡死了 ----
         try:
-            self.save_session(blocking=True)
-            self.save_config()
+            self.setWindowTitle(self.tr("exiting_tip"))
+            self.centralWidget().setEnabled(False)
         except Exception:
             pass
 
-        # 8. 直接结束进程：TerminateProcess 不会等待其它线程收尾，
-        #    万一有线程卡在驱动/管道调用里，也不会残留成关不掉的僵尸进程。
-        force_exit(0)
+        # ---- 7. 剩下的活全部甩到后台线程，GUI 线程立刻返回事件循环 ----
+        extractors = list(getattr(self, 'extractors', []) or [])
+        self._shutdown_done.clear()
+        # 后台清理完成后，由 GUI 主线程来做最后一步「结束本进程」：
+        # ExitProcess/TerminateProcess 从非主线程调用会去抢加载器锁，而主线程此刻
+        # 正待在 Qt 事件循环里 —— 那是一个真实的死锁点。所以这里用一个定时器
+        # 在主线程上收尾，后台线程只负责把 _shutdown_done 置位。
+        self._exit_timer = QTimer(self)
+        self._exit_timer.timeout.connect(self._final_exit_if_ready)
+        self._exit_timer.start(60)
+        # 先挂好看门狗：哪怕下面启动清理线程失败，也一定会退出
+        threading.Thread(target=self._exit_watchdog, daemon=True).start()
+        self._shutdown_thread = threading.Thread(
+            target=self._shutdown_worker,
+            args=(workers, extractors, payload, config_data, started),
+            daemon=True,
+        )
+        try:
+            self._shutdown_thread.start()
+        except Exception as exc:
+            log_exit("启动退出清理线程失败：%r，直接结束本进程。" % (exc,))
+            force_exit(1, why="start-shutdown-thread-failed")
+
+    def _final_exit_if_ready(self):
+        """（GUI 主线程）后台清理完成后的最后一步：结束本进程。"""
+        if not self._shutdown_done.is_set():
+            return
+        try:
+            self._exit_timer.stop()
+        except Exception:
+            pass
+        log_exit("后台清理已完成，由 GUI 主线程结束本进程。")
+        force_exit(0, why="main-thread")
+
+    def _exit_watchdog(self):
+        """硬上限：即使后台清理 / 主线程收尾被卡住，也绝不无限期挂在退出流程里。"""
+        time.sleep(SHUTDOWN_HARD_LIMIT)
+        try:
+            names = sorted({t.name for t in threading.enumerate()})
+            log_exit("看门狗触发（%.0fs）：后台清理%s完成；存活线程(%d)：%s" % (
+                SHUTDOWN_HARD_LIMIT,
+                "已" if self._shutdown_done.is_set() else "未",
+                len(names), ", ".join(names)))
+        except Exception:
+            log_exit("看门狗触发（%.0fs），强制结束本进程。" % SHUTDOWN_HARD_LIMIT)
+        force_exit(1, why="watchdog")
+
+    def _shutdown_worker(self, workers, extractors, payload, config_data, started):
+        """后台线程：限时结束子进程 -> 落盘 -> 结束本进程。
+
+        这里做的每一件事都带时限，任何一步失败都只记日志，绝不阻塞退出。
+        """
+        denied = []
+        try:
+            log_exit("开始退出：workers=%d extractors=%d 显卡监控=%r" % (
+                len(workers), len(extractors), getattr(self, 'gpu_monitor', False)))
+
+            # 1) worker 自己启动的 Blender：批量、共用一个截止时间
+            procs = [getattr(w, 'current_process', None) for w in workers]
+            denied += stop_processes(procs, grace=0.3, force_timeout=SHUTDOWN_KILL_BUDGET)
+
+            # 2) 参数提取线程（它们也可能挂着 Blender）。等待预算共用一个，不逐个累加
+            for ext in extractors:
+                try:
+                    ext.stop()
+                except Exception:
+                    pass
+            ext_deadline = time.time() + 1.2
+            for ext in extractors:
+                left = ext_deadline - time.time()
+                if left <= 0:
+                    break
+                try:
+                    ext.wait(int(left * 1000))
+                except Exception:
+                    pass
+
+            # 3) 兜底再清一遍：登记在册的 + 名下的 Blender 子进程
+            #    （独立进程模式下 worker 可能刚好又拉起了一个新进程）
+            denied += terminate_all_tracked_processes(grace=0.0, force_timeout=1.2)
+            denied += sweep_orphan_children(force_timeout=1.2)
+            # 最后再点名一次：明明已经 kill 过、却还活着（Popen.poll() 仍为 None），
+            # 那就是 Windows 意义上的「终止中 / 拒绝访问」，必须如实记下来
+            denied += _alive_pids(procs)
+            denied = sorted({int(pid) for pid in denied if pid})
+
+            if denied:
+                log_exit("以下进程结束不了（系统返回拒绝访问），已放弃并继续退出：%s" % denied)
+                if payload is not None:
+                    payload["log_content"] = (payload.get("log_content") or "") + (
+                        "<p>⚠️ 退出时仍有进程无法结束（系统返回“拒绝访问”）：%s。<br>"
+                        "这通常说明该进程已经卡在显卡驱动里、进入了系统级“终止中”状态，"
+                        "任务管理器 / taskkill /F 同样结束不了它，只能重启电脑彻底清掉。"
+                        "</p>" % denied)
+        except Exception as exc:
+            log_exit("退出清理出错：%r" % (exc,))
+
+        # 4) 落盘（必须在结束进程之前完成，否则会丢任务列表和日志）
+        try:
+            if payload is not None:
+                self._write_to_disk_task(payload)
+        except Exception as exc:
+            log_exit("保存会话失败：%r" % (exc,))
+        try:
+            if config_data is not None:
+                write_config_to_disk(config_data)
+        except Exception as exc:
+            log_exit("保存配置失败：%r" % (exc,))
+
+        # 5) 退出诊断：把「谁还活着」记下来。这几行是定位「关不掉」的关键证据。
+        try:
+            with self._gpu_lock:
+                gpu_info = tuple(self._gpu_info)
+            if self._gpu_polling:
+                log_exit("注意：退出时仍有一次显卡驱动查询(NVML/ADL)没有返回（已挂起 %.1fs），"
+                         "它很可能永久卡在驱动里，并会阻止本进程被彻底终止。"
+                         % (time.time() - getattr(self, '_gpu_poll_started_at', 0.0)))
+            log_exit("显卡信息=%r 显卡监控=%r" % (gpu_info, getattr(self, 'gpu_monitor', True)))
+            names = sorted({t.name for t in threading.enumerate()})
+            log_exit("退出时存活的线程(%d)：%s" % (len(names), ", ".join(names)))
+        except Exception as exc:
+            log_exit("退出诊断信息收集失败：%r" % (exc,))
+
+        # 6) 清理完成，把收尾交给 GUI 主线程（见 _final_exit_if_ready）
+        log_exit("清理完成，用时 %.2fs，等待主线程结束进程。" % (time.time() - started))
+        self._shutdown_done.set()
 
     def refresh_ui(self):
         if self.task_list.count() != len(self.tasks):
@@ -2438,9 +2962,7 @@ class MainWindow(QMainWindow):
         # 进度条交给 update_stat 按“已渲染 / 总帧数”重新计算，重新开始时不再归零
         self.update_stat()
         self.batch_start_time = time.time()
-        self.last_frame_time = time.time()
-        self.cached_avg_time_str = "--h--m--s"
-        self.cached_eta_str = "--h--m--s"
+        # 每个任务的计时在它真正开始渲染时（on_status_change）各自重置
 
         task_queue = queue.Queue()
         for t in valid_tasks:
@@ -2474,6 +2996,8 @@ class MainWindow(QMainWindow):
         self.refresh_ui()
 
     def on_worker_finished(self):
+        if getattr(self, '_exiting', False):
+            return
         self.active_workers = getattr(self, 'active_workers', 1) - 1
         if self.active_workers <= 0:
             self.on_all_done()
@@ -2485,55 +3009,40 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def update_frame_progress(self, current, total, format_str=""):
+    def update_frame_progress(self, task, current, total, format_str=""):
         if format_str == "DENOISING":
             self.frame_progress_bar.setMaximum(1)
             self.frame_progress_bar.setValue(1)
-            self.frame_progress_bar.setFormat(self.tr("denoising"))
+            label = self.tr("denoising")
         else:
             self.frame_progress_bar.setMaximum(total)
             self.frame_progress_bar.setValue(current)
             if format_str.startswith("TILES:"):
                 _, c_s, t_s, c_t, t_t = format_str.split(":")
-                formatted_text = self.tr("frame_sample_tiled").format(c_s=c_s, t_s=t_s, c_t=c_t, t_t=t_t)
-                self.frame_progress_bar.setFormat(formatted_text)
+                label = self.tr("frame_sample_tiled").format(c_s=c_s, t_s=t_s, c_t=c_t, t_t=t_t)
             else:
-                self.frame_progress_bar.setFormat(self.tr("frame_sample"))
+                label = self.tr("frame_sample")
+        # 并行渲染时多个 worker 会轮流刷新同一根进度条，标注清楚这是哪个任务的采样
+        if getattr(self, 'active_workers', 1) > 1:
+            idx = 0
+            try:
+                idx = self.tasks.index(task) + 1
+            except (ValueError, AttributeError):
+                idx = 0
+            if idx:
+                label = self.tr("frame_task_prefix").format(idx=idx, text=label)
+        self.frame_progress_bar.setFormat(label)
 
     def on_frame_done(self, task, real_frame_num):
+        if getattr(self, '_exiting', False):
+            return
         now = time.time()
-        cost_seconds = int(now - getattr(self, 'last_frame_time', now))
-        self.last_frame_time = now
+        # 按任务分别计时：并行渲染时两个任务的帧会交替上报，
+        # 用全局时间戳会把"别的任务的帧"算成这一帧的耗时（出现 0 秒/串台）。
+        cost_seconds = int(round(task.note_frame_rendered(now)))
         time_str = self.format_time_str(cost_seconds)
         # 按帧号去重统计：磁盘上已存在（被 Blender 跳过）或之前已统计过的帧不会重复计数
         task.mark_frame_done(real_frame_num)
-        time_up_to_now = now - getattr(self, 'batch_start_time', now)
-
-        total_frames = 0
-        rendered_frames = 0
-        for t in self.tasks:
-            if t.load_status == "Success":
-                t_total = count_task_frames(t)
-                total_frames += t_total
-                if t.status == "Completed":
-                    rendered_frames += t_total
-                else:
-                    rendered_frames += min(getattr(t, 'rendered_frames', 0), t_total)
-
-        if rendered_frames > 0:
-            self.cached_avg_time_str = self.format_time_str(cost_seconds)
-            try:
-                total_remaining = 0
-                for t in self.tasks:
-                    if t.load_status == "Success" and t.status != "Completed":
-                        t_total = count_task_frames(t)
-                        total_remaining += max(0, t_total - min(getattr(t, 'rendered_frames', 0), t_total))
-
-                eta = total_remaining * cost_seconds
-                self.cached_eta_str = self.format_time_str(eta)
-            except Exception:
-                eta = max(0, total_frames - rendered_frames) * cost_seconds
-                self.cached_eta_str = self.format_time_str(eta)
 
         task_idx = self.tasks.index(task) + 1
         frame_label = str(real_frame_num).strip() or str(getattr(task, 'rendered_frames', 0))
@@ -2548,16 +3057,58 @@ class MainWindow(QMainWindow):
 
         self.save_session()
 
+    def parallel_stats(self):
+        """并行渲染下的时间统计：当前最慢的一帧、正在渲染任务的平均单帧耗时。"""
+        now = time.time()
+        rendering = [t for t in self.tasks
+                     if t.load_status == "Success" and t.status == "Rendering"]
+        current = max((t.seconds_since_last_frame(now) for t in rendering), default=0.0)
+        measured = [t.average_frame_time() for t in rendering if t.average_frame_time() > 0]
+        if not measured:
+            # 任务切换的空档（当前没有任务在渲染）时，退回全部已测到速度的任务
+            measured = [t.average_frame_time() for t in self.tasks
+                        if t.load_status == "Success" and t.average_frame_time() > 0]
+        avg = sum(measured) / len(measured) if measured else 0.0
+        return current, avg
+
+    def estimate_remaining_seconds(self):
+        """并行下的剩余时间估算：总工作量 / 并行数，且不小于最长任务的收尾时间。"""
+        measured = [t.average_frame_time() for t in self.tasks
+                    if t.load_status == "Success" and t.average_frame_time() > 0]
+        if not measured:
+            return None
+        fallback = sum(measured) / len(measured)
+        workers = max(1, int(getattr(self, 'active_workers', 1) or 1))
+
+        total_work = 0.0
+        longest_task = 0.0
+        for t in self.tasks:
+            if t.load_status != "Success" or t.status == "Completed":
+                continue
+            t_total = count_task_frames(t)
+            left = max(0, t_total - min(getattr(t, 'rendered_frames', 0), t_total))
+            if left <= 0:
+                continue
+            work = left * (t.average_frame_time() or fallback)
+            total_work += work
+            longest_task = max(longest_task, work)
+        if total_work <= 0:
+            return 0.0
+        return max(total_work / workers, longest_task)
+
     def on_status_change(self, task_obj, status):
+        if getattr(self, '_exiting', False):
+            return
         task_obj.status = status
         if status == "Rendering":
-            self.last_frame_time = time.time()
-            self.current_task_start_time = time.time()
+            # 每个任务各自计时（并行时互不影响）
+            task_obj.reset_timing()
             task_idx = self.tasks.index(task_obj) + 1
             msg = self.tr("log_task_start").format(idx=task_idx, name=task_obj.name, path=task_obj.output_path)
             self.append_log(msg)
         elif status == "Completed":
-            cost = time.time() - getattr(self, 'current_task_start_time', time.time())
+            started = getattr(task_obj, 'rendering_started_at', 0.0) or time.time()
+            cost = time.time() - started
             msg = self.tr("log_task_done").format(name=task_obj.name, time_str=self.format_time_str(cost))
             self.append_log(msg)
         self.refresh_ui()
@@ -2565,6 +3116,9 @@ class MainWindow(QMainWindow):
         self.save_session()
 
     def on_all_done(self):
+        # 退出过程中绝不能再弹「渲染完成 -> 关机/重启」的确认框，那会挡住退出
+        if getattr(self, '_exiting', False):
+            return
         if not self.is_rendering:
             return
         self.is_rendering = False
@@ -2604,21 +3158,33 @@ class MainWindow(QMainWindow):
             if w.current_rendering_task:
                 w.current_rendering_task.status = "Stopped"
 
-        # 并行停止：先统一投递 CTRL_BREAK 快速结束，超时后再强杀整棵进程树，
-        # 避免残留在显卡驱动里变成关不掉的僵尸进程。
-        stop_processes([getattr(w, 'current_process', None) for w in workers],
-                       grace=1.2, force_timeout=4.0)
+        # 并行、限时地结束子进程。
+        # 以前是「每个 worker 各等 1.2s 优雅 + 各跑一遍 taskkill + 各 wait(2000)」，
+        # 8 个并行任务叠起来能把界面冻住十几秒（用户只能去任务管理器强杀，
+        # 而强杀一个正在收尾的进程恰好就是「拒绝访问」的来源）。
+        deadline = time.time() + 2.5
+        procs = [getattr(w, 'current_process', None) for w in workers]
+        denied = stop_processes(procs, grace=0.3, force_timeout=1.5)
 
+        # 兜底再确认一次（独立进程模式下 worker 可能刚好又拉起了一个 Blender）
+        if time.time() < deadline:
+            denied += stop_processes(
+                [getattr(w, 'current_process', None) for w in workers],
+                grace=0.0, force_timeout=max(0.2, deadline - time.time()))
+
+        # 等 worker 线程收尾，但总共只等到 deadline，而不是每个都再等 2 秒
         for w in workers:
+            left_ms = int(max(0.0, deadline - time.time()) * 1000)
+            if left_ms <= 0:
+                break
             try:
-                w.wait(2000)
+                w.wait(left_ms)
             except Exception:
                 pass
-            release_process_handles(getattr(w, 'current_process', None))
 
-        # 兜底：再确认一次（独立进程模式下 worker 可能刚又拉起了一个 Blender）
-        stop_processes([getattr(w, 'current_process', None) for w in workers],
-                       grace=0.0, force_timeout=3.0)
+        if denied:
+            self.append_log("⚠️ 有进程拒绝被结束（PID: %s），可能已经卡在显卡驱动里。"
+                            % sorted({int(p) for p in denied if p}))
 
         self.append_log(self.tr("log_stopped"))
         self.is_rendering = False
@@ -2672,19 +3238,19 @@ class MainWindow(QMainWindow):
         if p:
             self.out_path_edit.setText(p)
 
-    def save_config(self):
-        config_data = {
+    def _config_payload(self):
+        """把配置整理成纯数据（不含控件访问），GUI 线程取、后台线程写。"""
+        return {
             "blender_path": self.blender_path,
             "current_lang": self.current_lang,
             "window_width": self.width(),
             "window_height": self.height(),
             "splitter_sizes": self.main_splitter.sizes() if hasattr(self, 'main_splitter') else [500, 600],
+            "gpu_monitor": bool(getattr(self, 'gpu_monitor', True)),
         }
-        try:
-            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump(config_data, f)
-        except Exception:
-            pass
+
+    def save_config(self):
+        write_config_to_disk(self._config_payload())
 
     def load_config(self):
         if os.path.exists(CONFIG_FILE):
@@ -2693,6 +3259,10 @@ class MainWindow(QMainWindow):
                     config_data = json.load(f)
                 self.blender_path = config_data.get('blender_path', "")
                 self.current_lang = config_data.get('current_lang', "zh")
+                # 显卡监控默认关闭：它要调 NVML/ADL，而显卡驱动一旦无响应，
+                # 那个调用会永久卡在驱动里（这是「进程关不掉、只能重启」的实证成因）。
+                # 想要显卡数字就在配置里写 "gpu_monitor": true。
+                self.gpu_monitor = bool(config_data.get('gpu_monitor', False))
                 self.path_edit.setText(self.blender_path)
                 w = config_data.get('window_width', 1000)
                 h = config_data.get('window_height', 800)
@@ -2767,25 +3337,30 @@ class MainWindow(QMainWindow):
             return
 
     def get_gpu_info(self):
-        """返回 (利用率字符串, 显存字符串)"""
+        """返回 (利用率字符串, 显存字符串)。
+
+        只在第一次真正用到时才 nvmlInit()，之后一直复用，**不再每秒 nvmlShutdown()**：
+        反复 Init/Shutdown 会反复加载 nvml.dll（诊断快照里那个进程的模块表就有
+        两个 nvml.dll），而且 Shutdown 会打断别的线程正在进行的查询，属于典型的
+        「自己把驱动往坏状态里推」的用法。
+        """
         gpu_usage = "--"
         vram_str = "--"
-        try:
-            import pynvml
-            pynvml.nvmlInit()
-            device_count = pynvml.nvmlDeviceGetCount()
-            if device_count > 0:
-                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                gpu_usage = str(util.gpu)
-                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                used_gb = mem.used / (1024 ** 3)
-                total_gb = mem.total / (1024 ** 3)
-                vram_str = f"{used_gb:.1f}/{total_gb:.1f}G"
-            pynvml.nvmlShutdown()
-            return gpu_usage, vram_str
-        except Exception:
-            pass
+        pynvml = _nvml_module()
+        if pynvml is not None:
+            try:
+                device_count = pynvml.nvmlDeviceGetCount()
+                if device_count > 0:
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    gpu_usage = str(util.gpu)
+                    mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    used_gb = mem.used / (1024 ** 3)
+                    total_gb = mem.total / (1024 ** 3)
+                    vram_str = f"{used_gb:.1f}/{total_gb:.1f}G"
+                return gpu_usage, vram_str
+            except Exception:
+                pass
 
         try:
             from pyadl import ADLManager
@@ -2797,26 +3372,73 @@ class MainWindow(QMainWindow):
 
         return gpu_usage, vram_str
 
+    def poll_gpu_async(self):
+        """在后台线程里取显卡信息，GUI 线程只读缓存。
+
+        NVML / ADL 是直接和显卡驱动打交道的（内部有驱动锁 + ioctl）。
+        一旦驱动卡住（刚强杀完正在吃 GPU 的 Blender、或者发生了 TDR），
+        在 GUI 线程里调用就会把整个界面连同「关闭」一起冻住 —— 这正是
+        「关不掉 + 只能重启」的一条典型成因。
+        改成后台线程后，最坏情况也只是显卡数字不再刷新，界面和退出都不受影响。
+        """
+        if self._gpu_polling:
+            # 上一次查询还没回来。超过 2 秒就认为「显卡驱动无响应」：
+            # 这种调用会永久卡在驱动里，而一个卡在驱动里的线程足以让本进程
+            # 永远停在「终止中」状态（之后任务管理器强杀就是「拒绝访问」）。
+            # 所以这里永久停用显卡监控，不再往驱动里塞新的调用。
+            started = getattr(self, '_gpu_poll_started_at', 0.0)
+            if started and (time.time() - started) > 2.0 and not self._gpu_poll_slow:
+                self._gpu_poll_slow = True
+                with self._gpu_lock:
+                    self._gpu_info = ("驱动无响应", "已停用")
+                log_exit("显卡驱动查询超过 2s 未返回，已永久停用显卡监控（避免卡在驱动里）。")
+            return
+        if not getattr(self, 'gpu_monitor', False):
+            return
+        self._gpu_polling = True
+        self._gpu_poll_started_at = time.time()
+
+        def _job():
+            try:
+                info = self.get_gpu_info()
+                with self._gpu_lock:
+                    self._gpu_info = info
+            except Exception:
+                pass
+            finally:
+                self._gpu_polling = False
+
+        try:
+            threading.Thread(target=_job, daemon=True).start()
+        except Exception:
+            self._gpu_polling = False
+
+    def current_gpu_info(self):
+        with self._gpu_lock:
+            return self._gpu_info
+
     def update_system_resources(self):
         if not self.isVisible():
             return
         if HAS_PSUTIL:
             cpu = psutil.cpu_percent()
             ram = psutil.virtual_memory().percent
-            gpu, vram = self.get_gpu_info()
+            self.poll_gpu_async()
+            gpu, vram = self.current_gpu_info()
             self.res_label.setText(self.tr("cpu_ram_usage").format(cpu=cpu, ram=ram, gpu=gpu, vram=vram))
 
         if hasattr(self, 'is_rendering') and self.is_rendering and hasattr(self, 'batch_start_time'):
             now = time.time()
             total_time = now - self.batch_start_time
-            current_frame_time = now - getattr(self, 'last_frame_time', now)
-            avg_str = getattr(self, 'cached_avg_time_str', "--h--m--s")
-            eta_str = getattr(self, 'cached_eta_str', "--h--m--s")
+            # 并行时这些数值按任务分别算：当前帧 = 最慢的那一帧，平均帧 = 各任务平均值，
+            # 剩余时间 = 总工作量 / 并行数（不低于最长任务的收尾时间）
+            current_seconds, avg_seconds = self.parallel_stats()
+            eta_seconds = self.estimate_remaining_seconds()
             self.time_label.setText(self.tr("time_stats").format(
                 total=self.format_time_str(total_time),
-                current=self.format_time_str(current_frame_time),
-                avg=avg_str,
-                eta=eta_str
+                current=self.format_time_str(current_seconds) if current_seconds > 0 else "--h--m--s",
+                avg=self.format_time_str(avg_seconds) if avg_seconds > 0 else "--h--m--s",
+                eta=self.format_time_str(eta_seconds) if eta_seconds is not None else "--h--m--s"
             ))
         else:
             self.time_label.setText(self.tr("time_stats").format(
